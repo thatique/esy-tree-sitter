@@ -160,6 +160,65 @@ fn test_parsing_with_custom_utf16_input() {
     assert_eq!(root.child(0).unwrap().kind(), "function_item");
 }
 
+#[test]
+fn test_parsing_text_with_byte_order_mark() {
+    let mut parser = Parser::new();
+    parser.set_language(get_language("rust")).unwrap();
+
+    // Parse UTF16 text with a BOM
+    let tree = parser
+        .parse_utf16(
+            &"\u{FEFF}fn a() {}".encode_utf16().collect::<Vec<_>>(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        tree.root_node().to_sexp(),
+        "(source_file (function_item (identifier) (parameters) (block)))"
+    );
+    assert_eq!(tree.root_node().start_byte(), 2);
+
+    // Parse UTF8 text with a BOM
+    let mut tree = parser.parse("\u{FEFF}fn a() {}", None).unwrap();
+    assert_eq!(
+        tree.root_node().to_sexp(),
+        "(source_file (function_item (identifier) (parameters) (block)))"
+    );
+    assert_eq!(tree.root_node().start_byte(), 3);
+
+    // Edit the text, inserting a character before the BOM. The BOM is now an error.
+    tree.edit(&InputEdit {
+        start_byte: 0,
+        old_end_byte: 0,
+        new_end_byte: 1,
+        start_position: Point::new(0, 0),
+        old_end_position: Point::new(0, 0),
+        new_end_position: Point::new(0, 1),
+    });
+    let mut tree = parser.parse(" \u{FEFF}fn a() {}", Some(&tree)).unwrap();
+    assert_eq!(
+        tree.root_node().to_sexp(),
+        "(source_file (ERROR (UNEXPECTED 65279)) (function_item (identifier) (parameters) (block)))"
+    );
+    assert_eq!(tree.root_node().start_byte(), 1);
+
+    // Edit the text again, putting the BOM back at the beginning.
+    tree.edit(&InputEdit {
+        start_byte: 0,
+        old_end_byte: 1,
+        new_end_byte: 0,
+        start_position: Point::new(0, 0),
+        old_end_position: Point::new(0, 1),
+        new_end_position: Point::new(0, 0),
+    });
+    let tree = parser.parse("\u{FEFF}fn a() {}", Some(&tree)).unwrap();
+    assert_eq!(
+        tree.root_node().to_sexp(),
+        "(source_file (function_item (identifier) (parameters) (block)))"
+    );
+    assert_eq!(tree.root_node().start_byte(), 3);
+}
+
 // Incremental parsing
 
 #[test]
@@ -173,8 +232,9 @@ fn test_parsing_after_editing_beginning_of_code() {
         tree.root_node().to_sexp(),
         concat!(
             "(program (expression_statement (binary_expression ",
-              "(number) ",
-              "(binary_expression (number) (parenthesized_expression (binary_expression (number) (identifier)))))))",
+            "left: (number) ",
+            "right: (binary_expression left: (number) right: (parenthesized_expression ",
+            "(binary_expression left: (number) right: (identifier)))))))",
         )
     );
 
@@ -196,10 +256,12 @@ fn test_parsing_after_editing_beginning_of_code() {
         tree.root_node().to_sexp(),
         concat!(
             "(program (expression_statement (binary_expression ",
-              "(number) ",
-              "(binary_expression ",
-                "(number) ",
-                "(binary_expression (number) (parenthesized_expression (binary_expression (number) (identifier))))))))",
+            "left: (number) ",
+            "right: (binary_expression ",
+            "left: (number) ",
+            "right: (binary_expression ",
+            "left: (number) ",
+            "right: (parenthesized_expression (binary_expression left: (number) right: (identifier))))))))",
         )
     );
 
@@ -217,8 +279,8 @@ fn test_parsing_after_editing_end_of_code() {
         tree.root_node().to_sexp(),
         concat!(
             "(program (expression_statement (binary_expression ",
-            "(identifier) ",
-            "(parenthesized_expression (binary_expression (number) (identifier))))))",
+            "left: (identifier) ",
+            "right: (parenthesized_expression (binary_expression left: (number) right: (identifier))))))",
         )
     );
 
@@ -241,8 +303,12 @@ fn test_parsing_after_editing_end_of_code() {
         tree.root_node().to_sexp(),
         concat!(
             "(program (expression_statement (binary_expression ",
-              "(identifier) ",
-              "(parenthesized_expression (binary_expression (number) (member_expression (identifier) (property_identifier)))))))"
+            "left: (identifier) ",
+            "right: (parenthesized_expression (binary_expression ",
+            "left: (number) ",
+            "right: (member_expression ",
+            "object: (identifier) ",
+            "property: (property_identifier)))))))"
         )
     );
 
@@ -387,7 +453,7 @@ fn test_parsing_with_a_timeout() {
     );
     assert!(tree.is_none());
     assert!(start_time.elapsed().as_micros() > 500);
-    assert!(start_time.elapsed().as_micros() < 1500);
+    assert!(start_time.elapsed().as_micros() < 2000);
 
     // Finish parsing
     parser.set_timeout_micros(0);
@@ -482,9 +548,9 @@ fn test_parsing_with_one_included_range() {
     assert_eq!(
         js_tree.root_node().to_sexp(),
         concat!(
-            "(program (expression_statement (call_expression",
-            " (member_expression (identifier) (property_identifier))",
-            " (arguments (string)))))",
+            "(program (expression_statement (call_expression ",
+            "function: (member_expression object: (identifier) property: (property_identifier)) ",
+            "arguments: (arguments (string)))))",
         )
     );
     assert_eq!(
@@ -637,8 +703,8 @@ fn test_parsing_with_external_scanner_that_uses_included_range_boundaries() {
         root.to_sexp(),
         concat!(
             "(program",
-            " (expression_statement (call_expression (identifier) (arguments)))",
-            " (expression_statement (call_expression (identifier) (arguments))))"
+            " (expression_statement (call_expression function: (identifier) arguments: (arguments)))",
+            " (expression_statement (call_expression function: (identifier) arguments: (arguments))))"
         )
     );
 
@@ -754,7 +820,7 @@ fn test_parsing_with_a_newly_included_range() {
         first_tree.root_node().to_sexp(),
         concat!(
             "(program",
-            " (expression_statement (call_expression (identifier) (arguments))))",
+            " (expression_statement (call_expression function: (identifier) arguments: (arguments))))",
         )
     );
 
@@ -765,8 +831,8 @@ fn test_parsing_with_a_newly_included_range() {
         tree.root_node().to_sexp(),
         concat!(
             "(program",
-            " (expression_statement (call_expression (identifier) (arguments)))",
-            " (expression_statement (call_expression (identifier) (arguments))))",
+            " (expression_statement (call_expression function: (identifier) arguments: (arguments)))",
+            " (expression_statement (call_expression function: (identifier) arguments: (arguments))))",
         )
     );
 

@@ -1,6 +1,7 @@
 declare module 'web-tree-sitter' {
   class Parser {
     static init(): Promise<void>;
+    delete(): void;
     parse(input: string | Parser.Input, previousTree?: Parser.Tree): Parser.Tree;
     getLanguage(): any;
     setLanguage(language: any): void;
@@ -34,10 +35,11 @@ declare module 'web-tree-sitter' {
       type: "parse" | "lex"
     ) => void;
 
-    export interface Input {
-      seek(index: number): void;
-      read(): any;
-    }
+    export type Input = (
+      startIndex: number,
+      startPoint?: Point,
+      endIndex?: number,
+    ) => string | null;
 
     export interface SyntaxNode {
       tree: Tree;
@@ -72,6 +74,7 @@ declare module 'web-tree-sitter' {
 
       descendantForIndex(index: number): SyntaxNode;
       descendantForIndex(startIndex: number, endIndex: number): SyntaxNode;
+      descendantsOfType(type: string | Array<string>, startPosition?: Point, endPosition?: Point): Array<SyntaxNode>;
       namedDescendantForIndex(index: number): SyntaxNode;
       namedDescendantForIndex(startIndex: number, endIndex: number): SyntaxNode;
       descendantForPosition(position: Point): SyntaxNode;
@@ -90,9 +93,11 @@ declare module 'web-tree-sitter' {
       endPosition: Point;
       startIndex: number;
       endIndex: number;
-      readonly currentNode: SyntaxNode
 
-      reset(node: SyntaxNode): void
+      reset(node: SyntaxNode): void;
+      delete(): void;
+      currentNode(): SyntaxNode;
+      currentFieldName(): string;
       gotoParent(): boolean;
       gotoFirstChild(): boolean;
       gotoFirstChildForIndex(index: number): boolean;
@@ -102,10 +107,13 @@ declare module 'web-tree-sitter' {
     export interface Tree {
       readonly rootNode: SyntaxNode;
 
+      copy(): Tree;
+      delete(): void;
       edit(delta: Edit): Tree;
       walk(): TreeCursor;
       getChangedRanges(other: Tree): Range[];
       getEditedRange(other: Tree): Range;
+      getLanguage(): any;
     }
     namespace Language {
         function load(url: string): Promise<any>
