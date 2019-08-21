@@ -19,5 +19,5 @@ ${CC}                   \
   syntaxes/json_parser.c \
   syntaxes/c_parser.c \
 
-ar rcs libtree-sitter.a lib.o json_parser.o
+ar rcs libtree-sitter.a lib.o json_parser.o c_parser.o
 rm *.o
