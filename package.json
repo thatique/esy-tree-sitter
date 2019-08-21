@@ -1,6 +1,6 @@
 {
   "name": "esy-tree-sitter",
-  "version": "1.1.0",
+  "version": "1.4.0",
   "description": "esy-enabled build for tree-sitter",
   "license": "MIT",
   "esy": {
