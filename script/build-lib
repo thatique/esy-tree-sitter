@@ -24,6 +24,8 @@ ${CC}                      \
   lib/src/lib.c            \
   syntaxes/json_parser.c   \
   syntaxes/c_parser.c      \
+  syntaxes/cpp_parser.c    \
+  syntaxes/python_parser.c \
   syntaxes/js_parser.c     \
   syntaxes/scanners/js_scanner.c    \
   syntaxes/ts_parser.c     \
@@ -38,9 +40,7 @@ ${CXX}                       \
   $CFLAGS                    \
   -I lib/src                 \
   -I lib/include             \
-  syntaxes/cpp_parser.c      \
   syntaxes/scanners/cpp_scanner.cc    \
-  syntaxes/python_parser.c   \
   syntaxes/scanners/python_scanner.cc \
 
 ar rcs libtree-sitter.a \
