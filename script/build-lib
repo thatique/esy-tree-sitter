@@ -18,6 +18,7 @@ ${CC}                   \
   syntaxes/json_parser.c \
   syntaxes/c_parser.c \
   syntaxes/cpp_parser.c \
+  syntaxes/python_parser.c \
 
 ar rcs libtree-sitter.a lib.o json_parser.o
 rm *.o
