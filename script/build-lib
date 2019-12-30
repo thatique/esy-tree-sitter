@@ -15,8 +15,9 @@ ${CC}                   \
   -I lib/src            \
   -I lib/include        \
   lib/src/lib.c     \
-  -o tree-sitter.o
+  syntaxes/json_parser.c \
+  syntaxes/c_parser.c \
+  syntaxes/cpp_parser.c \
 
-rm -f libtree-sitter.a
-ar rcs libtree-sitter.a tree-sitter.o
-rm tree-sitter.o
+ar rcs libtree-sitter.a lib.o json_parser.o
+rm *.o
