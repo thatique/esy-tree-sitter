@@ -1,4 +1,4 @@
-#include "../../common/scanner.h"
+#include "ts_scanner.h"
 
 void *tree_sitter_tsx_external_scanner_create() { return NULL; }
 void tree_sitter_tsx_external_scanner_destroy(void *p) {}

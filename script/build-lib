@@ -7,40 +7,53 @@ else
   : ${CC:=gcc}
 fi
 
-${CC}                   \
-  -c                    \
-  -O3                   \
-  -std=c99              \
-  $CFLAGS               \
-  -I lib/src            \
-  -I lib/include        \
-  lib/src/lib.c     \
-  syntaxes/json_parser.c \
-  syntaxes/c_parser.c \
-  syntaxes/cpp_parser.c \
-  syntaxes/cpp_scanner.c \
-  syntaxes/python_parser.c \
-  syntaxes/python_scanner.c \
-  syntaxes/js_parser.c \
-  syntaxes/js_scanner.c \
-  syntaxes/ts_parser.c \
-  syntaxes/ts_scanner.c \
-  syntaxes/tsx_parser.c \
-  syntaxes/tsx_scanner.c \
+# If `CXX` isn't set, pick a default compiler
+if hash clang++ 2>/dev/null; then
+  : ${CXX:=clang++}
+else
+  : ${CXX:=g++}
+fi
+
+${CC}                      \
+  -c                       \
+  -O3                      \
+  -std=c99                 \
+  $CFLAGS                  \
+  -I lib/src               \
+  -I lib/include           \
+  lib/src/lib.c            \
+  syntaxes/json_parser.c   \
+  syntaxes/c_parser.c      \
+  syntaxes/js_parser.c     \
+  syntaxes/scanners/js_scanner.c    \
+  syntaxes/ts_parser.c     \
+  syntaxes/scanners/ts_scanner.c    \
+  syntaxes/scanners/ts_scanner.h    \
+  syntaxes/tsx_parser.c    \
+  syntaxes/scanners/tsx_scanner.c
+
+${CXX}                       \
+  -c                         \
+  -O3                        \
+  $CFLAGS                    \
+  -I lib/src                 \
+  -I lib/include             \
+  syntaxes/cpp_parser.c      \
+  syntaxes/scanners/cpp_scanner.cc    \
+  syntaxes/python_parser.c   \
+  syntaxes/scanners/python_scanner.cc
 
 ar rcs libtree-sitter.a \
-    lib.o \
-    json_parser.o \
-    c_parser.o \
-    cpp_parser.o \
-    cpp_scanner.o \
-    python_parser.o \
-    python_scanner.o \
-    js_parser.o \
-    js_scanner.o \
-    ts_parser.o \
-    ts_scanner.o \
-    tsx_parser.o \
-    tsx_scanner.o \
-
-rm *.o
+    lib.o               \
+    json_parser.o       \
+    c_parser.o          \
+    cpp_parser.o        \
+    cpp_scanner.o       \
+    python_parser.o     \
+    python_scanner.o    \
+    js_parser.o         \
+    js_scanner.o        \
+    ts_parser.o         \
+    ts_scanner.o        \
+    tsx_parser.o        \
+    tsx_scanner.o
