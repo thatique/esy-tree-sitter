@@ -30,7 +30,7 @@ ${CC}                      \
   syntaxes/scanners/ts_scanner.c    \
   syntaxes/scanners/ts_scanner.h    \
   syntaxes/tsx_parser.c    \
-  syntaxes/scanners/tsx_scanner.c
+  syntaxes/scanners/tsx_scanner.c   \
 
 ${CXX}                       \
   -c                         \
@@ -41,7 +41,7 @@ ${CXX}                       \
   syntaxes/cpp_parser.c      \
   syntaxes/scanners/cpp_scanner.cc    \
   syntaxes/python_parser.c   \
-  syntaxes/scanners/python_scanner.cc
+  syntaxes/scanners/python_scanner.cc \
 
 ar rcs libtree-sitter.a \
     lib.o               \
@@ -56,4 +56,6 @@ ar rcs libtree-sitter.a \
     ts_parser.o         \
     ts_scanner.o        \
     tsx_parser.o        \
-    tsx_scanner.o
+    tsx_scanner.o       \
+
+rm *.o
