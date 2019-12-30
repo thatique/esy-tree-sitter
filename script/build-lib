@@ -18,10 +18,29 @@ ${CC}                   \
   syntaxes/json_parser.c \
   syntaxes/c_parser.c \
   syntaxes/cpp_parser.c \
+  syntaxes/cpp_scanner.c \
   syntaxes/python_parser.c \
+  syntaxes/python_scanner.c \
   syntaxes/js_parser.c \
+  syntaxes/js_scanner.c \
   syntaxes/ts_parser.c \
+  syntaxes/ts_scanner.c \
   syntaxes/tsx_parser.c \
+  syntaxes/tsx_scanner.c \
 
-ar rcs libtree-sitter.a lib.o json_parser.o c_parser.o cpp_parser.o python_parser.o js_parser.o ts_parser.o tsx_parser.o
+ar rcs libtree-sitter.a \
+    lib.o \
+    json_parser.o \
+    c_parser.o \
+    cpp_parser.o \
+    cpp_scanner.o \
+    python_parser.o \
+    python_scanner.o \
+    js_parser.o \
+    js_scanner.o \
+    ts_parser.o \
+    ts_scanner.o \
+    tsx_parser.o \
+    tsx_scanner.o \
+
 rm *.o
