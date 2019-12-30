@@ -1,7 +1,7 @@
 use super::ExtractedSyntaxGrammar;
 use crate::generate::grammars::{Variable, VariableType};
 use crate::generate::rules::{Rule, Symbol};
-use hashbrown::HashMap;
+use std::collections::HashMap;
 use std::mem;
 
 struct Expander {
@@ -283,7 +283,7 @@ mod tests {
     fn build_grammar(variables: Vec<Variable>) -> ExtractedSyntaxGrammar {
         ExtractedSyntaxGrammar {
             variables,
-            extra_tokens: Vec::new(),
+            extra_symbols: Vec::new(),
             external_tokens: Vec::new(),
             expected_conflicts: Vec::new(),
             variables_to_inline: Vec::new(),

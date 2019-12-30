@@ -1,3 +1,4 @@
+use super::helpers::allocations;
 use super::helpers::edits::ReadRecorder;
 use super::helpers::fixtures::{get_language, get_test_language};
 use crate::generate::generate_parser_for_grammar;
@@ -7,7 +8,7 @@ use std::{thread, time};
 use tree_sitter::{InputEdit, LogType, Parser, Point, Range};
 
 #[test]
-fn test_basic_parsing() {
+fn test_parsing_simple_string() {
     let mut parser = Parser::new();
     parser.set_language(get_language("rust")).unwrap();
 
@@ -26,7 +27,11 @@ fn test_basic_parsing() {
 
     assert_eq!(
         root_node.to_sexp(),
-        "(source_file (struct_item (type_identifier) (field_declaration_list)) (function_item (identifier) (parameters) (block)))"
+        concat!(
+            "(source_file ",
+            "(struct_item name: (type_identifier) body: (field_declaration_list)) ",
+            "(function_item name: (identifier) parameters: (parameters) body: (block)))"
+        )
     );
 
     let struct_node = root_node.child(0).unwrap();
@@ -118,7 +123,17 @@ fn test_parsing_with_custom_utf8_input() {
         .unwrap();
 
     let root = tree.root_node();
-    assert_eq!(root.to_sexp(), "(source_file (function_item (visibility_modifier) (identifier) (parameters) (block (integer_literal))))");
+    assert_eq!(
+        root.to_sexp(),
+        concat!(
+            "(source_file ",
+            "(function_item ",
+            "(visibility_modifier) ",
+            "name: (identifier) ",
+            "parameters: (parameters) ",
+            "body: (block (integer_literal))))"
+        )
+    );
     assert_eq!(root.kind(), "source_file");
     assert_eq!(root.has_error(), false);
     assert_eq!(root.child(0).unwrap().kind(), "function_item");
@@ -154,10 +169,34 @@ fn test_parsing_with_custom_utf16_input() {
         .unwrap();
 
     let root = tree.root_node();
-    assert_eq!(root.to_sexp(), "(source_file (function_item (visibility_modifier) (identifier) (parameters) (block (integer_literal))))");
+    assert_eq!(
+        root.to_sexp(),
+        "(source_file (function_item (visibility_modifier) name: (identifier) parameters: (parameters) body: (block (integer_literal))))"
+    );
     assert_eq!(root.kind(), "source_file");
     assert_eq!(root.has_error(), false);
     assert_eq!(root.child(0).unwrap().kind(), "function_item");
+}
+
+#[test]
+fn test_parsing_with_callback_returning_owned_strings() {
+    let mut parser = Parser::new();
+    parser.set_language(get_language("rust")).unwrap();
+
+    let text = b"pub fn foo() { 1 }";
+
+    let tree = parser
+        .parse_with(
+            &mut |i, _| String::from_utf8(text[i..].to_vec()).unwrap(),
+            None,
+        )
+        .unwrap();
+
+    let root = tree.root_node();
+    assert_eq!(
+        root.to_sexp(),
+        "(source_file (function_item (visibility_modifier) name: (identifier) parameters: (parameters) body: (block (integer_literal))))"
+    );
 }
 
 #[test]
@@ -174,7 +213,7 @@ fn test_parsing_text_with_byte_order_mark() {
         .unwrap();
     assert_eq!(
         tree.root_node().to_sexp(),
-        "(source_file (function_item (identifier) (parameters) (block)))"
+        "(source_file (function_item name: (identifier) parameters: (parameters) body: (block)))"
     );
     assert_eq!(tree.root_node().start_byte(), 2);
 
@@ -182,7 +221,7 @@ fn test_parsing_text_with_byte_order_mark() {
     let mut tree = parser.parse("\u{FEFF}fn a() {}", None).unwrap();
     assert_eq!(
         tree.root_node().to_sexp(),
-        "(source_file (function_item (identifier) (parameters) (block)))"
+        "(source_file (function_item name: (identifier) parameters: (parameters) body: (block)))"
     );
     assert_eq!(tree.root_node().start_byte(), 3);
 
@@ -198,7 +237,7 @@ fn test_parsing_text_with_byte_order_mark() {
     let mut tree = parser.parse(" \u{FEFF}fn a() {}", Some(&tree)).unwrap();
     assert_eq!(
         tree.root_node().to_sexp(),
-        "(source_file (ERROR (UNEXPECTED 65279)) (function_item (identifier) (parameters) (block)))"
+        "(source_file (ERROR (UNEXPECTED 65279)) (function_item name: (identifier) parameters: (parameters) body: (block)))"
     );
     assert_eq!(tree.root_node().start_byte(), 1);
 
@@ -214,9 +253,50 @@ fn test_parsing_text_with_byte_order_mark() {
     let tree = parser.parse("\u{FEFF}fn a() {}", Some(&tree)).unwrap();
     assert_eq!(
         tree.root_node().to_sexp(),
-        "(source_file (function_item (identifier) (parameters) (block)))"
+        "(source_file (function_item name: (identifier) parameters: (parameters) body: (block)))"
     );
     assert_eq!(tree.root_node().start_byte(), 3);
+}
+
+#[test]
+fn test_parsing_invalid_chars_at_eof() {
+    let mut parser = Parser::new();
+    parser.set_language(get_language("json")).unwrap();
+    let tree = parser.parse(b"\xdf", None).unwrap();
+    assert_eq!(tree.root_node().to_sexp(), "(ERROR (UNEXPECTED INVALID))");
+}
+
+#[test]
+fn test_parsing_unexpected_null_characters_within_source() {
+    let mut parser = Parser::new();
+    parser.set_language(get_language("javascript")).unwrap();
+    let tree = parser.parse(b"var \0 something;", None).unwrap();
+    assert_eq!(
+        tree.root_node().to_sexp(),
+        "(program (variable_declaration (ERROR (UNEXPECTED '\\0')) (variable_declarator name: (identifier))))"
+    );
+}
+
+#[test]
+fn test_parsing_ends_when_input_callback_returns_empty() {
+    let mut parser = Parser::new();
+    parser.set_language(get_language("javascript")).unwrap();
+    let mut i = 0;
+    let source = b"abcdefghijklmnoqrs";
+    let tree = parser
+        .parse_with(
+            &mut |offset, _| {
+                i += 1;
+                if offset >= 6 {
+                    b""
+                } else {
+                    &source[offset..usize::min(source.len(), offset + 3)]
+                }
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(tree.root_node().end_byte(), 6);
 }
 
 // Incremental parsing
@@ -380,11 +460,11 @@ fn test_parsing_cancelled_by_another_thread() {
     let tree = parser.parse_with(
         &mut |offset, _| {
             if offset == 0 {
-                b" ["
+                " [".as_bytes()
             } else if offset >= 20000 {
-                b""
+                "".as_bytes()
             } else {
-                b"0,"
+                "0,".as_bytes()
             }
         },
         None,
@@ -461,11 +541,11 @@ fn test_parsing_with_a_timeout() {
         .parse_with(
             &mut |offset, _| {
                 if offset > 5000 {
-                    b""
+                    "".as_bytes()
                 } else if offset == 5000 {
-                    b"]"
+                    "]".as_bytes()
                 } else {
-                    b",0"
+                    ",0".as_bytes()
                 }
             },
             None,
@@ -527,6 +607,56 @@ fn test_parsing_with_a_timeout_and_a_reset() {
             .kind(),
         "null"
     );
+}
+
+#[test]
+fn test_parsing_with_a_timeout_and_implicit_reset() {
+    allocations::record(|| {
+        let mut parser = Parser::new();
+        parser.set_language(get_language("javascript")).unwrap();
+
+        parser.set_timeout_micros(5);
+        let tree = parser.parse(
+            "[\"ok\", 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]",
+            None,
+        );
+        assert!(tree.is_none());
+
+        // Changing the parser's language implicitly resets, discarding
+        // the previous partial parse.
+        parser.set_language(get_language("json")).unwrap();
+        parser.set_timeout_micros(0);
+        let tree = parser.parse(
+            "[null, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]",
+            None,
+        ).unwrap();
+        assert_eq!(
+            tree.root_node()
+                .named_child(0)
+                .unwrap()
+                .named_child(0)
+                .unwrap()
+                .kind(),
+            "null"
+        );
+    });
+}
+
+#[test]
+fn test_parsing_with_timeout_and_no_completion() {
+    allocations::record(|| {
+        let mut parser = Parser::new();
+        parser.set_language(get_language("javascript")).unwrap();
+
+        parser.set_timeout_micros(5);
+        let tree = parser.parse(
+            "[\"ok\", 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]",
+            None,
+        );
+        assert!(tree.is_none());
+
+        // drop the parser when it has an unfinished parse
+    });
 }
 
 // Included Ranges
@@ -767,7 +897,7 @@ fn test_parsing_with_a_newly_excluded_range() {
     );
 
     assert_eq!(
-        tree.changed_ranges(&first_tree),
+        tree.changed_ranges(&first_tree).collect::<Vec<_>>(),
         vec![
             // The first range that has changed syntax is the range of the newly-inserted text.
             Range {
@@ -837,12 +967,12 @@ fn test_parsing_with_a_newly_included_range() {
     );
 
     assert_eq!(
-        tree.changed_ranges(&first_tree),
+        tree.changed_ranges(&first_tree).collect::<Vec<_>>(),
         vec![Range {
-            start_byte: first_code_end_index + 1,
-            end_byte: second_code_end_index + 1,
-            start_point: Point::new(0, first_code_end_index + 1),
-            end_point: Point::new(0, second_code_end_index + 1),
+            start_byte: first_code_end_index,
+            end_byte: second_code_end_index,
+            start_point: Point::new(0, first_code_end_index),
+            end_point: Point::new(0, second_code_end_index),
         }]
     );
 }

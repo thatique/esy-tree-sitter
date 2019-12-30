@@ -62,14 +62,12 @@ done
 
 emcc=
 if which emcc > /dev/null && [[ "$force_docker" == "0" ]]; then
-  export EMCC_FORCE_STDLIBS=libc++
   emcc=emcc
 elif which docker > /dev/null; then
   emcc="docker run               \
     --rm                         \
     -v $(pwd):/src:Z             \
     -u $(id -u)                  \
-    -e EMCC_FORCE_STDLIBS=libc++ \
     trzeci/emscripten-slim       \
     emcc"
 else
@@ -91,9 +89,9 @@ $emcc                                \
   $emscripten_flags                  \
   -std=c99                           \
   -D 'fprintf(...)='                 \
+  -D NDEBUG=                         \
   -I lib/src                         \
   -I lib/include                     \
-  -I lib/utf8proc                    \
   --js-library ${web_dir}/imports.js \
   --pre-js ${web_dir}/prefix.js      \
   --post-js ${web_dir}/binding.js    \
@@ -113,7 +111,6 @@ if [[ "$minify_js" == "1" ]]; then
   ${web_dir}/node_modules/.bin/terser   \
     --compress                       \
     --mangle                         \
-    --keep-fnames                    \
     --keep-classnames                \
     -- target/scratch/tree-sitter.js \
     > $web_dir/tree-sitter.js

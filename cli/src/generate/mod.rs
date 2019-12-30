@@ -6,13 +6,12 @@ mod node_types;
 mod npm_files;
 pub mod parse_grammar;
 mod prepare_grammar;
-pub mod properties;
 mod render;
 mod rules;
 mod tables;
 
 use self::build_tables::build_tables;
-use self::grammars::{InlinedProductionMap, LexicalGrammar, SyntaxGrammar, VariableType};
+use self::grammars::{InlinedProductionMap, LexicalGrammar, SyntaxGrammar};
 use self::parse_grammar::parse_grammar;
 use self::prepare_grammar::prepare_grammar;
 use self::render::render_c_code;
@@ -20,9 +19,8 @@ use self::rules::AliasMap;
 use crate::error::{Error, Result};
 use lazy_static::lazy_static;
 use regex::{Regex, RegexBuilder};
-use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -33,6 +31,17 @@ lazy_static! {
         .unwrap();
 }
 
+const NEW_HEADER_PARTS: [&'static str; 2] = [
+    "
+  uint32_t large_state_count;
+  const uint16_t *small_parse_table;
+  const uint32_t *small_parse_table_map;
+  const TSSymbol *public_symbol_map;",
+    "
+#define SMALL_STATE(id) id - LARGE_STATE_COUNT
+",
+];
+
 struct GeneratedParser {
     c_code: String,
     node_types_json: String,
@@ -41,11 +50,11 @@ struct GeneratedParser {
 pub fn generate_parser_in_directory(
     repo_path: &PathBuf,
     grammar_path: Option<&str>,
-    properties_only: bool,
+    next_abi: bool,
+    report_symbol_name: Option<&str>,
 ) -> Result<()> {
     let src_path = repo_path.join("src");
     let header_path = src_path.join("tree_sitter");
-    let properties_dir_path = repo_path.join("properties");
 
     // Ensure that the output directories exist.
     fs::create_dir_all(&src_path)?;
@@ -70,53 +79,47 @@ pub fn generate_parser_in_directory(
         prepare_grammar(&input_grammar)?;
     let language_name = input_grammar.name;
 
-    // If run with no arguments, read all of the property sheets and compile them to JSON.
-    if grammar_path.is_none() {
-        let token_names = get_token_names(&syntax_grammar, &lexical_grammar);
-        if let Ok(entries) = fs::read_dir(properties_dir_path) {
-            for entry in entries {
-                let css_path = entry?.path();
-                let css = fs::read_to_string(&css_path)?;
-                let sheet = properties::generate_property_sheet(&css_path, &css, &token_names)?;
-                let property_sheet_json_path = src_path
-                    .join(css_path.file_name().unwrap())
-                    .with_extension("json");
-                let property_sheet_json_file =
-                    File::create(&property_sheet_json_path).map_err(Error::wrap(|| {
-                        format!("Failed to create {:?}", property_sheet_json_path)
-                    }))?;
-                let mut writer = BufWriter::new(property_sheet_json_file);
-                serde_json::to_writer_pretty(&mut writer, &sheet)?;
-            }
-        }
-    }
-
     // Generate the parser and related files.
-    if !properties_only {
-        let GeneratedParser {
-            c_code,
-            node_types_json,
-        } = generate_parser_for_grammar_with_opts(
-            &language_name,
-            syntax_grammar,
-            lexical_grammar,
-            inlines,
-            simple_aliases,
-        )?;
+    let GeneratedParser {
+        c_code,
+        node_types_json,
+    } = generate_parser_for_grammar_with_opts(
+        &language_name,
+        syntax_grammar,
+        lexical_grammar,
+        inlines,
+        simple_aliases,
+        next_abi,
+        report_symbol_name,
+    )?;
 
-        write_file(&src_path.join("parser.c"), c_code)?;
-        write_file(&src_path.join("node-types.json"), node_types_json)?;
+    write_file(&src_path.join("parser.c"), c_code)?;
+    write_file(&src_path.join("node-types.json"), node_types_json)?;
+
+    if next_abi {
         write_file(&header_path.join("parser.h"), tree_sitter::PARSER_HEADER)?;
-        ensure_file(&repo_path.join("index.js"), || {
-            npm_files::index_js(&language_name)
-        })?;
-        ensure_file(&src_path.join("binding.cc"), || {
-            npm_files::binding_cc(&language_name)
-        })?;
-        ensure_file(&repo_path.join("binding.gyp"), || {
-            npm_files::binding_gyp(&language_name)
-        })?;
+    } else {
+        let mut header = tree_sitter::PARSER_HEADER.to_string();
+
+        for part in &NEW_HEADER_PARTS {
+            let pos = header
+                .find(part)
+                .expect("Missing expected part of parser.h header");
+            header.replace_range(pos..(pos + part.len()), "");
+        }
+
+        write_file(&header_path.join("parser.h"), header)?;
     }
+
+    ensure_file(&repo_path.join("index.js"), || {
+        npm_files::index_js(&language_name)
+    })?;
+    ensure_file(&src_path.join("binding.cc"), || {
+        npm_files::binding_cc(&language_name)
+    })?;
+    ensure_file(&repo_path.join("binding.gyp"), || {
+        npm_files::binding_gyp(&language_name)
+    })?;
 
     Ok(())
 }
@@ -132,6 +135,8 @@ pub fn generate_parser_for_grammar(grammar_json: &str) -> Result<(String, String
         lexical_grammar,
         inlines,
         simple_aliases,
+        true,
+        None,
     )?;
     Ok((input_grammar.name, parser.c_code))
 }
@@ -142,8 +147,11 @@ fn generate_parser_for_grammar_with_opts(
     lexical_grammar: LexicalGrammar,
     inlines: InlinedProductionMap,
     simple_aliases: AliasMap,
+    next_abi: bool,
+    report_symbol_name: Option<&str>,
 ) -> Result<GeneratedParser> {
-    let variable_info = node_types::get_variable_info(&syntax_grammar, &lexical_grammar, &inlines)?;
+    let variable_info =
+        node_types::get_variable_info(&syntax_grammar, &lexical_grammar, &simple_aliases)?;
     let node_types_json = node_types::generate_node_types_json(
         &syntax_grammar,
         &lexical_grammar,
@@ -156,6 +164,7 @@ fn generate_parser_for_grammar_with_opts(
         &simple_aliases,
         &variable_info,
         &inlines,
+        report_symbol_name,
     )?;
     let c_code = render_c_code(
         name,
@@ -166,40 +175,12 @@ fn generate_parser_for_grammar_with_opts(
         syntax_grammar,
         lexical_grammar,
         simple_aliases,
+        next_abi,
     );
     Ok(GeneratedParser {
         c_code,
         node_types_json: serde_json::to_string_pretty(&node_types_json).unwrap(),
     })
-}
-
-fn get_token_names(
-    syntax_grammar: &SyntaxGrammar,
-    lexical_grammar: &LexicalGrammar,
-) -> HashSet<String> {
-    let mut result = HashSet::new();
-    for variable in &lexical_grammar.variables {
-        if variable.kind == VariableType::Named {
-            result.insert(variable.name.clone());
-        }
-    }
-    for token in &syntax_grammar.external_tokens {
-        if token.kind == VariableType::Named {
-            result.insert(token.name.clone());
-        }
-    }
-    for variable in &syntax_grammar.variables {
-        for production in &variable.productions {
-            for step in &production.steps {
-                if let Some(alias) = &step.alias {
-                    if !step.symbol.is_non_terminal() && alias.is_named {
-                        result.insert(alias.value.clone());
-                    }
-                }
-            }
-        }
-    }
-    result
 }
 
 fn load_grammar_file(grammar_path: &Path) -> Result<String> {

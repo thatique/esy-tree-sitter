@@ -1,21 +1,27 @@
-use super::item::{ParseItem, ParseItemSet, ParseItemSetCore, TokenSet};
+use super::item::{ParseItem, ParseItemSet, ParseItemSetCore};
 use super::item_set_builder::ParseItemSetBuilder;
 use crate::error::{Error, Result};
 use crate::generate::grammars::{
     InlinedProductionMap, LexicalGrammar, SyntaxGrammar, VariableType,
 };
 use crate::generate::node_types::VariableInfo;
-use crate::generate::rules::{Associativity, Symbol, SymbolType};
+use crate::generate::rules::{Associativity, Symbol, SymbolType, TokenSet};
 use crate::generate::tables::{
-    FieldLocation, ParseAction, ParseState, ParseStateId, ParseTable, ParseTableEntry,
+    FieldLocation, GotoAction, ParseAction, ParseState, ParseStateId, ParseTable, ParseTableEntry,
     ProductionInfo, ProductionInfoId,
 };
 use core::ops::Range;
-use hashbrown::hash_map::Entry;
-use hashbrown::{HashMap, HashSet};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::u32;
+
+// For conflict reporting, each parse state is associated with an example
+// sequence of symbols that could lead to that parse state.
+type SymbolSequence = Vec<Symbol>;
+
+type AuxiliarySymbolSequence = Vec<AuxiliarySymbolInfo>;
+pub(crate) type ParseStateInfo<'a> = (SymbolSequence, ParseItemSet<'a>);
 
 #[derive(Clone)]
 struct AuxiliarySymbolInfo {
@@ -23,13 +29,9 @@ struct AuxiliarySymbolInfo {
     parent_symbols: Vec<Symbol>,
 }
 
-type SymbolSequence = Vec<Symbol>;
-type AuxiliarySymbolSequence = Vec<AuxiliarySymbolInfo>;
-
 struct ParseStateQueueEntry {
-    preceding_symbols: SymbolSequence,
-    preceding_auxiliary_symbols: AuxiliarySymbolSequence,
     state_id: ParseStateId,
+    preceding_auxiliary_symbols: AuxiliarySymbolSequence,
 }
 
 struct ParseTableBuilder<'a> {
@@ -39,20 +41,21 @@ struct ParseTableBuilder<'a> {
     variable_info: &'a Vec<VariableInfo>,
     core_ids_by_core: HashMap<ParseItemSetCore<'a>, usize>,
     state_ids_by_item_set: HashMap<ParseItemSet<'a>, ParseStateId>,
-    item_sets_by_state_id: Vec<ParseItemSet<'a>>,
+    parse_state_info_by_id: Vec<ParseStateInfo<'a>>,
     parse_state_queue: VecDeque<ParseStateQueueEntry>,
+    non_terminal_extra_states: Vec<(Symbol, usize)>,
     parse_table: ParseTable,
 }
 
 impl<'a> ParseTableBuilder<'a> {
-    fn build(mut self) -> Result<ParseTable> {
+    fn build(mut self) -> Result<(ParseTable, Vec<ParseStateInfo<'a>>)> {
         // Ensure that the empty alias sequence has index 0.
         self.parse_table
             .production_infos
             .push(ProductionInfo::default());
 
         // Add the error state at index 0.
-        self.add_parse_state(&Vec::new(), &Vec::new(), ParseItemSet::default());
+        self.add_parse_state(&Vec::new(), &Vec::new(), ParseItemSet::default(), false);
 
         // Add the starting state at index 1.
         self.add_parse_state(
@@ -66,14 +69,47 @@ impl<'a> ParseTableBuilder<'a> {
                 .iter()
                 .cloned(),
             ),
+            false,
         );
+
+        // Compute the possible item sets for non-terminal extras.
+        let mut non_terminal_extra_item_sets_by_first_terminal = BTreeMap::new();
+        for extra_non_terminal in self
+            .syntax_grammar
+            .extra_symbols
+            .iter()
+            .filter(|s| s.is_non_terminal())
+        {
+            let variable = &self.syntax_grammar.variables[extra_non_terminal.index];
+            for production in &variable.productions {
+                non_terminal_extra_item_sets_by_first_terminal
+                    .entry(production.first_symbol().unwrap())
+                    .or_insert(ParseItemSet::default())
+                    .insert(
+                        ParseItem {
+                            variable_index: extra_non_terminal.index as u32,
+                            production,
+                            step_index: 1,
+                        },
+                        &[Symbol::end()].iter().cloned().collect(),
+                    );
+            }
+        }
+
+        // Add a state for each starting terminal of a non-terminal extra rule.
+        for (terminal, item_set) in non_terminal_extra_item_sets_by_first_terminal {
+            self.non_terminal_extra_states
+                .push((terminal, self.parse_table.states.len()));
+            self.add_parse_state(&Vec::new(), &Vec::new(), item_set, true);
+        }
 
         while let Some(entry) = self.parse_state_queue.pop_front() {
             let item_set = self
                 .item_set_builder
-                .transitive_closure(&self.item_sets_by_state_id[entry.state_id]);
+                .transitive_closure(&self.parse_state_info_by_id[entry.state_id].1);
+
             self.add_actions(
-                entry.preceding_symbols,
+                self.parse_state_info_by_id[entry.state_id].0.clone(),
                 entry.preceding_auxiliary_symbols,
                 entry.state_id,
                 item_set,
@@ -82,7 +118,7 @@ impl<'a> ParseTableBuilder<'a> {
 
         self.remove_precedences();
 
-        Ok(self.parse_table)
+        Ok((self.parse_table, self.parse_state_info_by_id))
     }
 
     fn add_parse_state(
@@ -90,9 +126,15 @@ impl<'a> ParseTableBuilder<'a> {
         preceding_symbols: &SymbolSequence,
         preceding_auxiliary_symbols: &AuxiliarySymbolSequence,
         item_set: ParseItemSet<'a>,
+        is_non_terminal_extra: bool,
     ) -> ParseStateId {
         match self.state_ids_by_item_set.entry(item_set) {
+            // If an equivalent item set has already been processed, then return
+            // the existing parse state index.
             Entry::Occupied(o) => *o.get(),
+
+            // Otherwise, insert a new parse state and add it to the queue of
+            // parse states to populate.
             Entry::Vacant(v) => {
                 let core = v.key().core();
                 let core_count = self.core_ids_by_core.len();
@@ -105,17 +147,20 @@ impl<'a> ParseTableBuilder<'a> {
                 };
 
                 let state_id = self.parse_table.states.len();
-                self.item_sets_by_state_id.push(v.key().clone());
+                self.parse_state_info_by_id
+                    .push((preceding_symbols.clone(), v.key().clone()));
+
                 self.parse_table.states.push(ParseState {
                     id: state_id,
                     lex_state_id: 0,
+                    external_lex_state_id: 0,
                     terminal_entries: HashMap::new(),
                     nonterminal_entries: HashMap::new(),
                     core_id,
+                    is_non_terminal_extra,
                 });
                 self.parse_state_queue.push_back(ParseStateQueueEntry {
                     state_id,
-                    preceding_symbols: preceding_symbols.clone(),
                     preceding_auxiliary_symbols: preceding_auxiliary_symbols.clone(),
                 });
                 v.insert(state_id);
@@ -131,11 +176,16 @@ impl<'a> ParseTableBuilder<'a> {
         state_id: ParseStateId,
         item_set: ParseItemSet<'a>,
     ) -> Result<()> {
-        let mut terminal_successors = HashMap::new();
-        let mut non_terminal_successors = HashMap::new();
-        let mut lookaheads_with_conflicts = HashSet::new();
+        let mut terminal_successors = BTreeMap::new();
+        let mut non_terminal_successors = BTreeMap::new();
+        let mut lookaheads_with_conflicts = TokenSet::new();
 
+        // Each item in the item set contributes to either or a Shift action or a Reduce
+        // action in this state.
         for (item, lookaheads) in &item_set.entries {
+            // If the item is unfinished, then this state has a transition for the item's
+            // next symbol. Advance the item to its next step and insert the resulting
+            // item into the successor item set.
             if let Some(next_symbol) = item.symbol() {
                 let successor = item.successor();
                 if next_symbol.is_non_terminal() {
@@ -157,7 +207,10 @@ impl<'a> ParseTableBuilder<'a> {
                         .or_insert_with(|| ParseItemSet::default())
                         .insert(successor, lookaheads);
                 }
-            } else {
+            }
+            // If the item is finished, then add a Reduce action to this state based
+            // on this item.
+            else {
                 let action = if item.is_augmented() {
                     ParseAction::Accept
                 } else {
@@ -176,6 +229,10 @@ impl<'a> ParseTableBuilder<'a> {
                         .terminal_entries
                         .entry(lookahead);
                     let entry = entry.or_insert_with(|| ParseTableEntry::new());
+
+                    // While inserting Reduce actions, eagerly resolve conflicts related
+                    // to precedence: avoid inserting lower-precedence reductions, and
+                    // clear the action list when inserting higher-precedence reductions.
                     if entry.actions.is_empty() {
                         entry.actions.push(action);
                     } else if action.precedence() > entry.actions[0].precedence() {
@@ -190,12 +247,16 @@ impl<'a> ParseTableBuilder<'a> {
             }
         }
 
+        // Having computed the the successor item sets for each symbol, add a new
+        // parse state for each of these item sets, and add a corresponding Shift
+        // action to this state.
         for (symbol, next_item_set) in terminal_successors {
             preceding_symbols.push(symbol);
             let next_state_id = self.add_parse_state(
                 &preceding_symbols,
                 &preceding_auxiliary_symbols,
                 next_item_set,
+                self.parse_table.states[state_id].is_non_terminal_extra,
             );
             preceding_symbols.pop();
 
@@ -223,14 +284,20 @@ impl<'a> ParseTableBuilder<'a> {
                 &preceding_symbols,
                 &preceding_auxiliary_symbols,
                 next_item_set,
+                self.parse_table.states[state_id].is_non_terminal_extra,
             );
             preceding_symbols.pop();
             self.parse_table.states[state_id]
                 .nonterminal_entries
-                .insert(symbol, next_state_id);
+                .insert(symbol, GotoAction::Goto(next_state_id));
         }
 
-        for symbol in lookaheads_with_conflicts {
+        // For any symbol with multiple actions, perform conflict resolution.
+        // This will either
+        // * choose one action over the others using precedence or associativity
+        // * keep multiple actions if this conflict has been whitelisted in the grammar
+        // * fail, terminating the parser generation process
+        for symbol in lookaheads_with_conflicts.iter() {
             self.handle_conflict(
                 &item_set,
                 state_id,
@@ -240,15 +307,50 @@ impl<'a> ParseTableBuilder<'a> {
             )?;
         }
 
+        // Finally, add actions for the grammar's `extra` symbols.
         let state = &mut self.parse_table.states[state_id];
-        for extra_token in &self.syntax_grammar.extra_tokens {
-            state
-                .terminal_entries
-                .entry(*extra_token)
-                .or_insert(ParseTableEntry {
-                    reusable: true,
-                    actions: vec![ParseAction::ShiftExtra],
-                });
+        let is_non_terminal_extra = state.is_non_terminal_extra;
+        let is_end_of_non_terminal_extra =
+            is_non_terminal_extra && state.terminal_entries.len() == 1;
+
+        // Add actions for the start tokens of each non-terminal extra rule.
+        // These actions are added to every state except for the states that are
+        // alread within non-terminal extras. Non-terminal extras are not allowed
+        // to nest within each other.
+        if !is_non_terminal_extra {
+            for (terminal, state_id) in &self.non_terminal_extra_states {
+                state
+                    .terminal_entries
+                    .entry(*terminal)
+                    .or_insert(ParseTableEntry {
+                        reusable: true,
+                        actions: vec![ParseAction::Shift {
+                            state: *state_id,
+                            is_repetition: false,
+                        }],
+                    });
+            }
+        }
+
+        // Add ShiftExtra actions for the terminal extra tokens. These actions
+        // are added to every state except for those at the ends of non-terminal
+        // extras.
+        if !is_end_of_non_terminal_extra {
+            for extra_token in &self.syntax_grammar.extra_symbols {
+                if extra_token.is_non_terminal() {
+                    state
+                        .nonterminal_entries
+                        .insert(*extra_token, GotoAction::ShiftExtra);
+                } else {
+                    state
+                        .terminal_entries
+                        .entry(*extra_token)
+                        .or_insert(ParseTableEntry {
+                            reusable: true,
+                            actions: vec![ParseAction::ShiftExtra],
+                        });
+                }
+            }
         }
 
         Ok(())
@@ -359,8 +461,8 @@ impl<'a> ParseTableBuilder<'a> {
                     }
                 }
 
-                // If all reduce actions are left associative, remove the SHIFT action.
-                // If all reduce actions are right associative, remove the REDUCE actions.
+                // If all Reduce actions are left associative, remove the SHIFT action.
+                // If all Reduce actions are right associative, remove the REDUCE actions.
                 match (has_left, has_non, has_right) {
                     (true, false, false) => {
                         entry.actions.pop();
@@ -741,7 +843,7 @@ fn populate_following_tokens(
             }
         }
     }
-    for extra in &grammar.extra_tokens {
+    for extra in &grammar.extra_symbols {
         if extra.is_terminal() {
             for entry in result.iter_mut() {
                 entry.insert(*extra);
@@ -751,12 +853,12 @@ fn populate_following_tokens(
     }
 }
 
-pub(crate) fn build_parse_table(
-    syntax_grammar: &SyntaxGrammar,
-    lexical_grammar: &LexicalGrammar,
-    inlines: &InlinedProductionMap,
-    variable_info: &Vec<VariableInfo>,
-) -> Result<(ParseTable, Vec<TokenSet>)> {
+pub(crate) fn build_parse_table<'a>(
+    syntax_grammar: &'a SyntaxGrammar,
+    lexical_grammar: &'a LexicalGrammar,
+    inlines: &'a InlinedProductionMap,
+    variable_info: &'a Vec<VariableInfo>,
+) -> Result<(ParseTable, Vec<TokenSet>, Vec<ParseStateInfo<'a>>)> {
     let item_set_builder = ParseItemSetBuilder::new(syntax_grammar, lexical_grammar, inlines);
     let mut following_tokens = vec![TokenSet::new(); lexical_grammar.variables.len()];
     populate_following_tokens(
@@ -766,23 +868,25 @@ pub(crate) fn build_parse_table(
         &item_set_builder,
     );
 
-    let table = ParseTableBuilder {
+    let (table, item_sets) = ParseTableBuilder {
         syntax_grammar,
         lexical_grammar,
         item_set_builder,
         variable_info,
+        non_terminal_extra_states: Vec::new(),
         state_ids_by_item_set: HashMap::new(),
         core_ids_by_core: HashMap::new(),
-        item_sets_by_state_id: Vec::new(),
+        parse_state_info_by_id: Vec::new(),
         parse_state_queue: VecDeque::new(),
         parse_table: ParseTable {
             states: Vec::new(),
             symbols: Vec::new(),
+            external_lex_states: Vec::new(),
             production_infos: Vec::new(),
-            max_aliased_production_length: 0,
+            max_aliased_production_length: 1,
         },
     }
     .build()?;
 
-    Ok((table, following_tokens))
+    Ok((table, following_tokens, item_sets))
 }

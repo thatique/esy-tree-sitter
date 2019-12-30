@@ -1,8 +1,9 @@
 use super::helpers::edits::get_random_edit;
-use super::helpers::fixtures::{get_language, get_test_language};
+use super::helpers::fixtures::{fixtures_dir, get_language, get_test_language};
 use super::helpers::random::Rand;
 use crate::generate::generate_parser_for_grammar;
 use crate::parse::perform_edit;
+use std::fs;
 use tree_sitter::{Node, Parser, Point, Tree};
 
 const JSON_EXAMPLE: &'static str = r#"
@@ -164,6 +165,66 @@ fn test_node_child() {
     assert_eq!(object_node.parent().unwrap(), array_node);
     assert_eq!(array_node.parent().unwrap(), tree.root_node());
     assert_eq!(tree.root_node().parent(), None);
+}
+
+#[test]
+fn test_node_children() {
+    let tree = parse_json_example();
+    let mut cursor = tree.walk();
+    let array_node = tree.root_node().child(0).unwrap();
+    assert_eq!(
+        array_node
+            .children(&mut cursor)
+            .map(|n| n.kind())
+            .collect::<Vec<_>>(),
+        &["[", "number", ",", "false", ",", "object", "]",]
+    );
+    assert_eq!(
+        array_node
+            .named_children(&mut cursor)
+            .map(|n| n.kind())
+            .collect::<Vec<_>>(),
+        &["number", "false", "object"]
+    );
+    let object_node = array_node
+        .named_children(&mut cursor)
+        .find(|n| n.kind() == "object")
+        .unwrap();
+    assert_eq!(
+        object_node
+            .children(&mut cursor)
+            .map(|n| n.kind())
+            .collect::<Vec<_>>(),
+        &["{", "pair", "}",]
+    );
+}
+
+#[test]
+fn test_node_children_by_field_name() {
+    let mut parser = Parser::new();
+    parser.set_language(get_language("python")).unwrap();
+    let source = "
+        if one:
+            a()
+        elif two:
+            b()
+        elif three:
+            c()
+        elif four:
+            d()
+    ";
+
+    let tree = parser.parse(source, None).unwrap();
+    let node = tree.root_node().child(0).unwrap();
+    assert_eq!(node.kind(), "if_statement");
+    let mut cursor = tree.walk();
+    let alternatives = node.children_by_field_name("alternative", &mut cursor);
+    let alternative_texts =
+        alternatives.map(|n| &source[n.child_by_field_name("condition").unwrap().byte_range()]);
+    assert_eq!(
+        alternative_texts.collect::<Vec<_>>(),
+        &["two", "three", "four",]
+    );
 }
 
 #[test]
@@ -593,6 +654,94 @@ fn test_node_field_calls_in_language_without_fields() {
     assert_eq!(cursor.field_name(), None);
     assert_eq!(cursor.goto_first_child(), true);
     assert_eq!(cursor.field_name(), None);
+}
+
+#[test]
+fn test_node_is_named_but_aliased_as_anonymous() {
+    let (parser_name, parser_code) = generate_parser_for_grammar(
+        &fs::read_to_string(
+            &fixtures_dir()
+                .join("test_grammars")
+                .join("named_rule_aliased_as_anonymous")
+                .join("grammar.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut parser = Parser::new();
+    let language = get_test_language(&parser_name, &parser_code, None);
+    parser.set_language(language).unwrap();
+
+    let tree = parser.parse("B C B", None).unwrap();
+
+    let root_node = tree.root_node();
+    assert!(!root_node.has_error());
+    assert_eq!(root_node.child_count(), 3);
+    assert_eq!(root_node.named_child_count(), 2);
+
+    let aliased = root_node.child(0).unwrap();
+    assert!(!aliased.is_named());
+    assert_eq!(aliased.kind(), "the-alias");
+
+    assert_eq!(root_node.named_child(0).unwrap().kind(), "c");
+}
+
+#[test]
+fn test_node_numeric_symbols_respect_simple_aliases() {
+    let mut parser = Parser::new();
+    parser.set_language(get_language("python")).unwrap();
+
+    // Example 1:
+    // Python argument lists can contain "splat" arguments, which are not allowed within
+    // other expressions. This includes `parenthesized_list_splat` nodes like `(*b)`. These
+    // `parenthesized_list_splat` nodes are aliased as `parenthesized_expression`. Their numeric
+    // `symbol`, aka `kind_id` should match that of a normal `parenthesized_expression`.
+    let tree = parser.parse("(a((*b)))", None).unwrap();
+    let root = tree.root_node();
+    assert_eq!(
+        root.to_sexp(),
+        "(module (expression_statement (parenthesized_expression (call function: (identifier) arguments: (argument_list (parenthesized_expression (list_splat (identifier))))))))",
+    );
+
+    let outer_expr_node = root.child(0).unwrap().child(0).unwrap();
+    assert_eq!(outer_expr_node.kind(), "parenthesized_expression");
+
+    let inner_expr_node = outer_expr_node
+        .named_child(0)
+        .unwrap()
+        .child_by_field_name("arguments")
+        .unwrap()
+        .named_child(0)
+        .unwrap();
+    assert_eq!(inner_expr_node.kind(), "parenthesized_expression");
+    assert_eq!(inner_expr_node.kind_id(), outer_expr_node.kind_id());
+
+    // Example 2:
+    // Ruby handles the unary (negative) and binary (minus) `-` operators using two different
+    // tokens. One or more of these is an external token that's aliased as `-`. Their numeric
+    // kind ids should match.
+    parser.set_language(get_language("ruby")).unwrap();
+    let tree = parser.parse("-a - b", None).unwrap();
+    let root = tree.root_node();
+    assert_eq!(
+        root.to_sexp(),
+        "(program (binary left: (unary (identifier)) right: (identifier)))",
+    );
+
+    let binary_node = root.child(0).unwrap();
+    assert_eq!(binary_node.kind(), "binary");
+
+    let unary_minus_node = binary_node
+        .child_by_field_name("left")
+        .unwrap()
+        .child(0)
+        .unwrap();
+    assert_eq!(unary_minus_node.kind(), "-");
+
+    let binary_minus_node = binary_node.child_by_field_name("operator").unwrap();
+    assert_eq!(binary_minus_node.kind(), "-");
+    assert_eq!(unary_minus_node.kind_id(), binary_minus_node.kind_id());
 }
 
 fn get_all_nodes(tree: &Tree) -> Vec<Node> {

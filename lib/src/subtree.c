@@ -18,19 +18,8 @@ typedef struct {
   Length new_end;
 } Edit;
 
-TSStateId TS_TREE_STATE_NONE = USHRT_MAX;
-
-#ifdef TREE_SITTER_TEST
-
-#define TS_MAX_INLINE_TREE_LENGTH 2
-#define TS_MAX_TREE_POOL_SIZE 0
-
-#else
-
 #define TS_MAX_INLINE_TREE_LENGTH UINT8_MAX
 #define TS_MAX_TREE_POOL_SIZE 32
-
-#endif
 
 static const ExternalScannerState empty_state = {.length = 0, .short_data = {0}};
 
@@ -777,10 +766,10 @@ Subtree ts_subtree_last_external_token(Subtree tree) {
 }
 
 static size_t ts_subtree__write_char_to_string(char *s, size_t n, int32_t c) {
-  if (c == 0)
-    return snprintf(s, n, "EOF");
   if (c == -1)
     return snprintf(s, n, "INVALID");
+  else if (c == '\0')
+    return snprintf(s, n, "'\\0'");
   else if (c == '\n')
     return snprintf(s, n, "'\\n'");
   else if (c == '\t')
@@ -819,9 +808,12 @@ static size_t ts_subtree__write_to_string(
   bool is_root = field_name == ROOT_FIELD;
   bool is_visible =
     include_all ||
-    alias_is_named ||
     ts_subtree_missing(self) ||
-    (ts_subtree_visible(self) && ts_subtree_named(self));
+    (
+      alias_symbol
+        ? alias_is_named
+        : ts_subtree_visible(self) && ts_subtree_named(self)
+    );
 
   if (is_visible) {
     if (!is_root) {

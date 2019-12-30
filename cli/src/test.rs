@@ -10,14 +10,14 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::str;
-use tree_sitter::{Language, LogType, Parser};
+use tree_sitter::{Language, LogType, Parser, Query};
 
 lazy_static! {
     static ref HEADER_REGEX: ByteRegex = ByteRegexBuilder::new(r"^===+\r?\n([^=]*)\r?\n===+\r?\n")
         .multi_line(true)
         .build()
         .unwrap();
-    static ref DIVIDER_REGEX: ByteRegex = ByteRegexBuilder::new(r"\r?\n---+\r?\n")
+    static ref DIVIDER_REGEX: ByteRegex = ByteRegexBuilder::new(r"^---+\r?\n")
         .multi_line(true)
         .build()
         .unwrap();
@@ -96,6 +96,24 @@ pub fn run_tests_at_path(
     } else {
         Ok(())
     }
+}
+
+pub fn check_queries_at_path(language: Language, path: &Path) -> Result<()> {
+    if path.exists() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let hidden = entry.file_name().to_str().unwrap_or("").starts_with(".");
+            if !hidden {
+                let content = fs::read_to_string(entry.path()).map_err(Error::wrap(|| {
+                    format!("Error reading query file {:?}", entry.file_name())
+                }))?;
+                Query::new(language, &content).map_err(Error::wrap(|| {
+                    format!("Error in query file {:?}", entry.file_name())
+                }))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn print_diff_key() {
@@ -183,7 +201,10 @@ pub fn parse_tests(path: &Path) -> io::Result<TestEntry> {
         let mut children = Vec::new();
         for entry in fs::read_dir(path)? {
             let entry = entry?;
-            children.push(parse_tests(&entry.path())?);
+            let hidden = entry.file_name().to_str().unwrap_or("").starts_with(".");
+            if !hidden {
+                children.push(parse_tests(&entry.path())?);
+            }
         }
         Ok(TestEntry::Group { name, children })
     } else {
@@ -199,29 +220,42 @@ pub fn strip_sexp_fields(sexp: String) -> String {
 fn parse_test_content(name: String, content: String) -> TestEntry {
     let mut children = Vec::new();
     let bytes = content.as_bytes();
-    let mut previous_name = String::new();
-    let mut previous_header_end = 0;
-    for header_match in HEADER_REGEX
+    let mut prev_name = String::new();
+    let mut prev_header_end = 0;
+
+    // Identify all of the test descriptions using the `======` headers.
+    for (header_start, header_end) in HEADER_REGEX
         .find_iter(&bytes)
         .map(|m| (m.start(), m.end()))
         .chain(Some((bytes.len(), bytes.len())))
     {
-        let (header_start, header_end) = header_match;
-        if previous_header_end > 0 {
-            if let Some(divider_match) =
-                DIVIDER_REGEX.find(&bytes[previous_header_end..header_start])
-            {
-                let (divider_start, divider_end) = (
-                    previous_header_end + divider_match.start(),
-                    previous_header_end + divider_match.end(),
-                );
+        // Find the longest line of dashes following each test description.
+        // That is the divider between input and expected output.
+        if prev_header_end > 0 {
+            let divider_match = DIVIDER_REGEX
+                .find_iter(&bytes[prev_header_end..header_start])
+                .map(|m| (prev_header_end + m.start(), prev_header_end + m.end()))
+                .max_by_key(|(start, end)| end - start);
+            if let Some((divider_start, divider_end)) = divider_match {
                 if let Ok(output) = str::from_utf8(&bytes[divider_end..header_start]) {
-                    let input = bytes[previous_header_end..divider_start].to_vec();
+                    let mut input = bytes[prev_header_end..divider_start].to_vec();
+
+                    // Remove trailing newline from the input.
+                    input.pop();
+                    if input.last() == Some(&b'\r') {
+                        input.pop();
+                    }
+
+                    // Normalize the whitespace in the expected output.
                     let output = WHITESPACE_REGEX.replace_all(output.trim(), " ").to_string();
                     let output = output.replace(" )", ")");
+
+                    // Identify if the expected output has fields indicated. If not, then
+                    // fields will not be checked.
                     let has_fields = SEXP_FIELD_REGEX.is_match(&output);
+
                     children.push(TestEntry::Example {
-                        name: previous_name,
+                        name: prev_name,
                         input,
                         output,
                         has_fields,
@@ -229,10 +263,10 @@ fn parse_test_content(name: String, content: String) -> TestEntry {
                 }
             }
         }
-        previous_name = String::from_utf8_lossy(&bytes[header_start..header_end])
+        prev_name = String::from_utf8_lossy(&bytes[header_start..header_end])
             .trim_matches(|c| char::is_whitespace(c) || c == '=')
             .to_string();
-        previous_header_end = header_end;
+        prev_header_end = header_end;
     }
     TestEntry::Group { name, children }
 }
@@ -283,6 +317,58 @@ d
                         name: "The second test".to_string(),
                         input: "d".as_bytes().to_vec(),
                         output: "(d)".to_string(),
+                        has_fields: false,
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_test_content_with_dashes_in_source_code() {
+        let entry = parse_test_content(
+            "the-filename".to_string(),
+            r#"
+==================
+Code with dashes
+==================
+abc
+---
+defg
+----
+hijkl
+-------
+
+(a (b))
+
+=========================
+Code ending with dashes
+=========================
+abc
+-----------
+-------------------
+
+(c (d))
+        "#
+            .trim()
+            .to_string(),
+        );
+
+        assert_eq!(
+            entry,
+            TestEntry::Group {
+                name: "the-filename".to_string(),
+                children: vec![
+                    TestEntry::Example {
+                        name: "Code with dashes".to_string(),
+                        input: "abc\n---\ndefg\n----\nhijkl".as_bytes().to_vec(),
+                        output: "(a (b))".to_string(),
+                        has_fields: false,
+                    },
+                    TestEntry::Example {
+                        name: "Code ending with dashes".to_string(),
+                        input: "abc\n-----------".as_bytes().to_vec(),
+                        output: "(c (d))".to_string(),
                         has_fields: false,
                     },
                 ]

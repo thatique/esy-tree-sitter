@@ -14,10 +14,9 @@ ${CC}                   \
   $CFLAGS               \
   -I lib/src            \
   -I lib/include        \
-  -I lib/utf8proc       \
   lib/src/lib.c     \
-  syntaxes/json_parser.c \
-  syntaxes/c_parser.c \
+  -o tree-sitter.o
 
-ar rcs libtree-sitter.a lib.o json_parser.o c_parser.o
-rm *.o
+rm -f libtree-sitter.a
+ar rcs libtree-sitter.a tree-sitter.o
+rm tree-sitter.o

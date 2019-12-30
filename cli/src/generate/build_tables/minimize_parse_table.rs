@@ -1,11 +1,12 @@
-use super::item::TokenSet;
 use super::token_conflicts::TokenConflictMap;
 use crate::generate::dedup::split_state_id_groups;
 use crate::generate::grammars::{LexicalGrammar, SyntaxGrammar, VariableType};
-use crate::generate::rules::{AliasMap, Symbol};
-use crate::generate::tables::{ParseAction, ParseState, ParseStateId, ParseTable, ParseTableEntry};
-use hashbrown::{HashMap, HashSet};
+use crate::generate::rules::{AliasMap, Symbol, TokenSet};
+use crate::generate::tables::{
+    GotoAction, ParseAction, ParseState, ParseStateId, ParseTable, ParseTableEntry,
+};
 use log::info;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 
 pub(crate) fn minimize_parse_table(
@@ -27,6 +28,7 @@ pub(crate) fn minimize_parse_table(
     minimizer.merge_compatible_states();
     minimizer.remove_unit_reductions();
     minimizer.remove_unused_states();
+    minimizer.reorder_states_by_descending_size();
 }
 
 struct Minimizer<'a> {
@@ -101,7 +103,10 @@ impl<'a> Minimizer<'a> {
                 state.update_referenced_states(|other_state_id, state| {
                     if let Some(symbol) = unit_reduction_symbols_by_state.get(&other_state_id) {
                         done = false;
-                        state.nonterminal_entries[symbol]
+                        match state.nonterminal_entries.get(symbol) {
+                            Some(GotoAction::Goto(state_id)) => *state_id,
+                            _ => other_state_id,
+                        }
                     } else {
                         other_state_id
                     }
@@ -262,18 +267,24 @@ impl<'a> Minimizer<'a> {
 
         for (symbol, s1) in &state1.nonterminal_entries {
             if let Some(s2) = state2.nonterminal_entries.get(symbol) {
-                let group1 = group_ids_by_state_id[*s1];
-                let group2 = group_ids_by_state_id[*s2];
-                if group1 != group2 {
-                    info!(
-                        "split states {} {} - successors for {} are split: {} {}",
-                        state1.id,
-                        state2.id,
-                        self.symbol_name(symbol),
-                        s1,
-                        s2,
-                    );
-                    return true;
+                match (s1, s2) {
+                    (GotoAction::ShiftExtra, GotoAction::ShiftExtra) => continue,
+                    (GotoAction::Goto(s1), GotoAction::Goto(s2)) => {
+                        let group1 = group_ids_by_state_id[*s1];
+                        let group2 = group_ids_by_state_id[*s2];
+                        if group1 != group2 {
+                            info!(
+                                "split states {} {} - successors for {} are split: {} {}",
+                                state1.id,
+                                state2.id,
+                                self.symbol_name(symbol),
+                                s1,
+                                s2,
+                            );
+                            return true;
+                        }
+                    }
+                    _ => return true,
                 }
             }
         }
@@ -454,5 +465,38 @@ impl<'a> Minimizer<'a> {
             }
             original_state_id += 1;
         }
+    }
+
+    fn reorder_states_by_descending_size(&mut self) {
+        // Get a mapping of old state index -> new_state_index
+        let mut old_ids_by_new_id = (0..self.parse_table.states.len()).collect::<Vec<_>>();
+        &old_ids_by_new_id.sort_unstable_by_key(|i| {
+            // Don't changes states 0 (the error state) or 1 (the start state).
+            if *i <= 1 {
+                return *i as i64 - 1_000_000;
+            }
+
+            // Reorder all the other states by descending symbol count.
+            let state = &self.parse_table.states[*i];
+            -((state.terminal_entries.len() + state.nonterminal_entries.len()) as i64)
+        });
+
+        // Get the inverse mapping
+        let mut new_ids_by_old_id = vec![0; old_ids_by_new_id.len()];
+        for (id, old_id) in old_ids_by_new_id.iter().enumerate() {
+            new_ids_by_old_id[*old_id] = id;
+        }
+
+        // Reorder the parse states and update their references to reflect
+        // the new ordering.
+        self.parse_table.states = old_ids_by_new_id
+            .iter()
+            .map(|old_id| {
+                let mut state = ParseState::default();
+                mem::swap(&mut state, &mut self.parse_table.states[*old_id]);
+                state.update_referenced_states(|id, _| new_ids_by_old_id[id]);
+                state
+            })
+            .collect();
     }
 }

@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::SystemTime;
 use std::{fs, mem};
-use tree_sitter::{Language, PropertySheet};
-use tree_sitter_highlight::{load_property_sheet, Properties};
+use tree_sitter::Language;
+use tree_sitter_highlight::HighlightConfiguration;
 
 #[cfg(unix)]
 const DYLIB_EXTENSION: &'static str = "so";
@@ -20,23 +21,29 @@ const DYLIB_EXTENSION: &'static str = "dll";
 
 const BUILD_TARGET: &'static str = env!("BUILD_TARGET");
 
-#[derive(Default)]
-pub struct LanguageConfiguration {
+pub struct LanguageConfiguration<'a> {
     pub scope: Option<String>,
     pub content_regex: Option<Regex>,
     pub _first_line_regex: Option<Regex>,
     pub injection_regex: Option<Regex>,
     pub file_types: Vec<String>,
-    pub highlight_property_sheet_path: Option<PathBuf>,
+    pub root_path: PathBuf,
+    pub highlights_filenames: Option<Vec<String>>,
+    pub injections_filenames: Option<Vec<String>>,
+    pub locals_filenames: Option<Vec<String>>,
     language_id: usize,
-    highlight_property_sheet: OnceCell<Option<PropertySheet<Properties>>>,
+    highlight_config: OnceCell<Option<HighlightConfiguration>>,
+    highlight_names: &'a Mutex<Vec<String>>,
+    use_all_highlight_names: bool,
 }
 
 pub struct Loader {
     parser_lib_path: PathBuf,
     languages_by_id: Vec<(PathBuf, OnceCell<Language>)>,
-    language_configurations: Vec<LanguageConfiguration>,
+    language_configurations: Vec<LanguageConfiguration<'static>>,
     language_configuration_ids_by_file_type: HashMap<String, Vec<usize>>,
+    highlight_names: Box<Mutex<Vec<String>>>,
+    use_all_highlight_names: bool,
 }
 
 unsafe impl Send for Loader {}
@@ -49,7 +56,20 @@ impl Loader {
             languages_by_id: Vec::new(),
             language_configurations: Vec::new(),
             language_configuration_ids_by_file_type: HashMap::new(),
+            highlight_names: Box::new(Mutex::new(Vec::new())),
+            use_all_highlight_names: true,
         }
+    }
+
+    pub fn configure_highlights(&mut self, names: &Vec<String>) {
+        self.use_all_highlight_names = false;
+        let mut highlights = self.highlight_names.lock().unwrap();
+        highlights.clear();
+        highlights.extend(names.iter().cloned());
+    }
+
+    pub fn highlight_names(&self) -> Vec<String> {
+        self.highlight_names.lock().unwrap().clone()
     }
 
     pub fn find_all_languages(&mut self, parser_src_paths: &Vec<PathBuf>) -> Result<()> {
@@ -134,7 +154,6 @@ impl Loader {
                 if configuration_ids.len() == 1 {
                     configuration = &self.language_configurations[configuration_ids[0]];
                 }
-
                 // If multiple language configurations match, then determine which
                 // one to use by applying the configurations' content regexes.
                 else {
@@ -151,7 +170,6 @@ impl Loader {
                             if let Some(mat) = content_regex.find(&file_contents) {
                                 score = (mat.end() - mat.start()) as isize;
                             }
-
                             // If the content regex does not match, then *penalize* this
                             // language configuration, so that language configurations
                             // without content regexes are preferred over those with
@@ -338,10 +356,63 @@ impl Loader {
         Ok(language)
     }
 
-    fn find_language_configurations_at_path<'a>(
+    pub fn highlight_config_for_injection_string<'a>(
+        &'a self,
+        string: &str,
+    ) -> Option<&'a HighlightConfiguration> {
+        match self.language_configuration_for_injection_string(string) {
+            Err(e) => {
+                eprintln!(
+                    "Failed to load language for injection string '{}': {}",
+                    string,
+                    e.message()
+                );
+                None
+            }
+            Ok(None) => None,
+            Ok(Some((language, configuration))) => match configuration.highlight_config(language) {
+                Err(e) => {
+                    eprintln!(
+                        "Failed to load property sheet for injection string '{}': {}",
+                        string,
+                        e.message()
+                    );
+                    None
+                }
+                Ok(None) => None,
+                Ok(Some(config)) => Some(config),
+            },
+        }
+    }
+
+    pub fn find_language_configurations_at_path<'a>(
         &'a mut self,
         parser_path: &Path,
     ) -> Result<&[LanguageConfiguration]> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum PathsJSON {
+            Empty,
+            Single(String),
+            Multiple(Vec<String>),
+        }
+
+        impl Default for PathsJSON {
+            fn default() -> Self {
+                PathsJSON::Empty
+            }
+        }
+
+        impl PathsJSON {
+            fn into_vec(self) -> Option<Vec<String>> {
+                match self {
+                    PathsJSON::Empty => None,
+                    PathsJSON::Single(s) => Some(vec![s]),
+                    PathsJSON::Multiple(s) => Some(s),
+                }
+            }
+        }
+
         #[derive(Deserialize)]
         struct LanguageConfigurationJSON {
             #[serde(default)]
@@ -355,7 +426,12 @@ impl Loader {
             first_line_regex: Option<String>,
             #[serde(rename = "injection-regex")]
             injection_regex: Option<String>,
-            highlights: Option<String>,
+            #[serde(default)]
+            highlights: PathsJSON,
+            #[serde(default)]
+            injections: PathsJSON,
+            #[serde(default)]
+            locals: PathsJSON,
         }
 
         #[derive(Deserialize)]
@@ -394,22 +470,19 @@ impl Loader {
                     });
 
                     let configuration = LanguageConfiguration {
+                        root_path: parser_path.to_path_buf(),
                         scope: config_json.scope,
                         language_id,
                         file_types: config_json.file_types.unwrap_or(Vec::new()),
-                        content_regex: config_json
-                            .content_regex
-                            .and_then(|r| RegexBuilder::new(&r).multi_line(true).build().ok()),
-                        _first_line_regex: config_json
-                            .first_line_regex
-                            .and_then(|r| RegexBuilder::new(&r).multi_line(true).build().ok()),
-                        injection_regex: config_json
-                            .injection_regex
-                            .and_then(|r| RegexBuilder::new(&r).multi_line(true).build().ok()),
-                        highlight_property_sheet_path: config_json
-                            .highlights
-                            .map(|h| parser_path.join(h)),
-                        highlight_property_sheet: OnceCell::new(),
+                        content_regex: Self::regex(config_json.content_regex),
+                        _first_line_regex: Self::regex(config_json.first_line_regex),
+                        injection_regex: Self::regex(config_json.injection_regex),
+                        injections_filenames: config_json.injections.into_vec(),
+                        locals_filenames: config_json.locals.into_vec(),
+                        highlights_filenames: config_json.highlights.into_vec(),
+                        highlight_config: OnceCell::new(),
+                        highlight_names: &*self.highlight_names,
+                        use_all_highlight_names: self.use_all_highlight_names,
                     };
 
                     for file_type in &configuration.file_types {
@@ -419,7 +492,8 @@ impl Loader {
                             .push(self.language_configurations.len());
                     }
 
-                    self.language_configurations.push(configuration);
+                    self.language_configurations
+                        .push(unsafe { mem::transmute(configuration) });
                 }
             }
         }
@@ -427,48 +501,88 @@ impl Loader {
         if self.language_configurations.len() == initial_language_configuration_count
             && parser_path.join("src").join("grammar.json").exists()
         {
-            self.language_configurations.push(LanguageConfiguration {
+            let configuration = LanguageConfiguration {
+                root_path: parser_path.to_owned(),
                 language_id: self.languages_by_id.len(),
+                file_types: Vec::new(),
                 scope: None,
                 content_regex: None,
-                injection_regex: None,
-                file_types: Vec::new(),
                 _first_line_regex: None,
-                highlight_property_sheet_path: None,
-                highlight_property_sheet: OnceCell::new(),
-            });
+                injection_regex: None,
+                injections_filenames: None,
+                locals_filenames: None,
+                highlights_filenames: None,
+                highlight_config: OnceCell::new(),
+                highlight_names: &*self.highlight_names,
+                use_all_highlight_names: self.use_all_highlight_names,
+            };
+            self.language_configurations
+                .push(unsafe { mem::transmute(configuration) });
             self.languages_by_id
                 .push((parser_path.to_owned(), OnceCell::new()));
         }
 
         Ok(&self.language_configurations[initial_language_configuration_count..])
     }
+
+    fn regex(pattern: Option<String>) -> Option<Regex> {
+        pattern.and_then(|r| RegexBuilder::new(&r).multi_line(true).build().ok())
+    }
 }
 
-impl LanguageConfiguration {
-    pub fn highlight_property_sheet(
-        &self,
-        language: Language,
-    ) -> Result<Option<&PropertySheet<Properties>>> {
-        self.highlight_property_sheet
+impl<'a> LanguageConfiguration<'a> {
+    pub fn highlight_config(&self, language: Language) -> Result<Option<&HighlightConfiguration>> {
+        self.highlight_config
             .get_or_try_init(|| {
-                if let Some(path) = &self.highlight_property_sheet_path {
-                    let sheet_json = fs::read_to_string(path).map_err(Error::wrap(|| {
-                        format!(
-                            "Failed to read property sheet {:?}",
-                            path.file_name().unwrap()
-                        )
-                    }))?;
-                    let sheet =
-                        load_property_sheet(language, &sheet_json).map_err(Error::wrap(|| {
-                            format!(
-                                "Failed to parse property sheet {:?}",
-                                path.file_name().unwrap()
-                            )
-                        }))?;
-                    Ok(Some(sheet))
-                } else {
+                let queries_path = self.root_path.join("queries");
+                let read_queries = |paths: &Option<Vec<String>>, default_path: &str| {
+                    if let Some(paths) = paths.as_ref() {
+                        let mut query = String::new();
+                        for path in paths {
+                            let path = self.root_path.join(path);
+                            query += &fs::read_to_string(&path).map_err(Error::wrap(|| {
+                                format!("Failed to read query file {:?}", path)
+                            }))?;
+                        }
+                        Ok(query)
+                    } else {
+                        let path = queries_path.join(default_path);
+                        if path.exists() {
+                            fs::read_to_string(&path).map_err(Error::wrap(|| {
+                                format!("Failed to read query file {:?}", path)
+                            }))
+                        } else {
+                            Ok(String::new())
+                        }
+                    }
+                };
+
+                let highlights_query = read_queries(&self.highlights_filenames, "highlights.scm")?;
+                let injections_query = read_queries(&self.injections_filenames, "injections.scm")?;
+                let locals_query = read_queries(&self.locals_filenames, "locals.scm")?;
+
+                if highlights_query.is_empty() {
                     Ok(None)
+                } else {
+                    let mut result = HighlightConfiguration::new(
+                        language,
+                        &highlights_query,
+                        &injections_query,
+                        &locals_query,
+                    )
+                    .map_err(Error::wrap(|| {
+                        format!("Failed to load queries in {:?}", self.root_path)
+                    }))?;
+                    let mut all_highlight_names = self.highlight_names.lock().unwrap();
+                    if self.use_all_highlight_names {
+                        for capture_name in result.query.capture_names() {
+                            if !all_highlight_names.contains(capture_name) {
+                                all_highlight_names.push(capture_name.clone());
+                            }
+                        }
+                    }
+                    result.configure(&all_highlight_names);
+                    Ok(Some(result))
                 }
             })
             .map(Option::as_ref)

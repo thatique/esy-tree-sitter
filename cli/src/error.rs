@@ -1,6 +1,7 @@
+use super::test_highlight;
 use std::fmt::Write;
 use std::io;
-use tree_sitter_highlight::PropertySheetError;
+use tree_sitter::QueryError;
 
 #[derive(Debug)]
 pub struct Error(pub Vec<String>);
@@ -50,6 +51,36 @@ impl Error {
     }
 }
 
+impl<'a> From<QueryError> for Error {
+    fn from(error: QueryError) -> Self {
+        match error {
+            QueryError::Capture(row, c) => Error::new(format!(
+                "Query error on line {}: Invalid capture name {}",
+                row, c
+            )),
+            QueryError::Field(row, f) => Error::new(format!(
+                "Query error on line {}: Invalid field name {}",
+                row, f
+            )),
+            QueryError::NodeType(row, t) => Error::new(format!(
+                "Query error on line {}. Invalid node type {}",
+                row, t
+            )),
+            QueryError::Syntax(row, l) => Error::new(format!(
+                "Query error on line {}. Invalid syntax:\n{}",
+                row, l
+            )),
+            QueryError::Predicate(p) => Error::new(format!("Query error: {}", p)),
+        }
+    }
+}
+
+impl<'a> From<tree_sitter_highlight::Error> for Error {
+    fn from(error: tree_sitter_highlight::Error) -> Self {
+        Error::new(format!("{:?}", error))
+    }
+}
+
 impl From<serde_json::Error> for Error {
     fn from(error: serde_json::Error) -> Self {
         Error::new(error.to_string())
@@ -62,8 +93,14 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<rsass::Error> for Error {
-    fn from(error: rsass::Error) -> Self {
+impl From<glob::PatternError> for Error {
+    fn from(error: glob::PatternError) -> Self {
+        Error::new(error.to_string())
+    }
+}
+
+impl From<glob::GlobError> for Error {
+    fn from(error: glob::GlobError) -> Self {
         Error::new(error.to_string())
     }
 }
@@ -74,18 +111,14 @@ impl From<regex_syntax::ast::Error> for Error {
     }
 }
 
-impl From<String> for Error {
-    fn from(error: String) -> Self {
-        Error::new(error)
+impl From<test_highlight::Failure> for Error {
+    fn from(error: test_highlight::Failure) -> Self {
+        Error::new(error.message())
     }
 }
 
-impl From<PropertySheetError> for Error {
-    fn from(error: PropertySheetError) -> Self {
-        match error {
-            PropertySheetError::InvalidFormat(e) => Self::from(e),
-            PropertySheetError::InvalidRegex(e) => Self::regex(&e.to_string()),
-            PropertySheetError::InvalidJSON(e) => Self::from(e),
-        }
+impl From<String> for Error {
+    fn from(error: String) -> Self {
+        Error::new(error)
     }
 }
