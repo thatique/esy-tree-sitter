@@ -6,7 +6,7 @@
   "esy": {
     "build": [
         ["bash", "-c", "echo", "#{os}"],
-        ["bash", "-c", "#{os == 'windows' ? 'CC=x86_64-w64-mingw32-gcc CC=x86_64-w64-mingw32-g++ script/build-lib' : 'echo'}"],
+        ["bash", "-c", "#{os == 'windows' ? 'CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ script/build-lib' : 'echo'}"],
         ["bash", "-c", "#{os == 'linux' ? 'CFLAGS=-fPIC script/build-lib' : 'echo'}"],
         ["bash", "-c", "#{os == 'darwin' ? 'CC=gcc CXX=g++ script/build-lib' : 'echo'}"],
         ["bash", "-c", "#{os == 'macOS' ? 'CC=gcc CXX=g++ script/build-lib' : 'echo'}"]
