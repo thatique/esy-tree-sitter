@@ -7,17 +7,9 @@ else
   : ${CC:=gcc}
 fi
 
-# If `CXX` isn't set, pick a default compiler
-if hash clang++ 2>/dev/null; then
-  : ${CXX:=clang++}
-else
-  : ${CXX:=g++}
-fi
-
 ${CC}                                    \
   -c                                     \
   -O3                                    \
-  -std=c99                               \
   $CFLAGS                                \
   -I lib/src                             \
   -I lib/include                         \
@@ -25,7 +17,9 @@ ${CC}                                    \
   syntaxes/json_parser.c                 \
   syntaxes/c_parser.c                    \
   syntaxes/cpp_parser.c                  \
+  syntaxes/scanners/cpp_scanner.cc       \
   syntaxes/python_parser.c               \
+  syntaxes/scanners/python_scanner.cc    \
   syntaxes/javascript_parser.c           \
   syntaxes/scanners/javascript_scanner.c \
   syntaxes/typescript_parser.c           \
@@ -33,15 +27,6 @@ ${CC}                                    \
   syntaxes/scanners/ts_scanner.h         \
   syntaxes/tsx_parser.c                  \
   syntaxes/scanners/tsx_scanner.c        \
-
-${CXX}                                \
-  -c                                  \
-  -O3                                 \
-  $CFLAGS                             \
-  -I lib/src                          \
-  -I lib/include                      \
-  syntaxes/scanners/cpp_scanner.cc    \
-  syntaxes/scanners/python_scanner.cc \
 
 ar rcs libtree-sitter.a  \
     lib.o                \
