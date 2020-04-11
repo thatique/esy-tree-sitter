@@ -1,1 +1,1 @@
-run-fuzzer
+Symlink caused build issues, when we don't need this. Removed and replaced with placeholder.
