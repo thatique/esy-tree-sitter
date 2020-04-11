@@ -167,7 +167,22 @@ extern "C" {
     #[doc = " The second and third parameters specify the location and length of an array"]
     #[doc = " of ranges. The parser does *not* take ownership of these ranges; it copies"]
     #[doc = " the data, so it doesn\'t matter how these ranges are allocated."]
-    pub fn ts_parser_set_included_ranges(self_: *mut TSParser, ranges: *const TSRange, length: u32);
+    #[doc = ""]
+    #[doc = " If `length` is zero, then the entire document will be parsed. Otherwise,"]
+    #[doc = " the given ranges must be ordered from earliest to latest in the document,"]
+    #[doc = " and they must not overlap. That is, the following must hold for all"]
+    #[doc = " `i` < `length - 1`:"]
+    #[doc = " ```text"]
+    #[doc = "     ranges[i].end_byte <= ranges[i + 1].start_byte"]
+    #[doc = " ```"]
+    #[doc = " If this requirement is not satisfied, the operation will fail, the ranges"]
+    #[doc = " will not be assigned, and this function will return `false`. On success,"]
+    #[doc = " this function returns `true`"]
+    pub fn ts_parser_set_included_ranges(
+        self_: *mut TSParser,
+        ranges: *const TSRange,
+        length: u32,
+    ) -> bool;
 }
 extern "C" {
     #[doc = " Get the ranges of text that the parser will include when parsing."]
@@ -297,13 +312,6 @@ extern "C" {
     #[doc = " to pipe these graphs directly to a `dot(1)` process in order to generate"]
     #[doc = " SVG output. You can turn off this logging by passing a negative number."]
     pub fn ts_parser_print_dot_graphs(self_: *mut TSParser, file: ::std::os::raw::c_int);
-}
-extern "C" {
-    #[doc = " Set whether or not the parser should halt immediately upon detecting an"]
-    #[doc = " error. This will generally result in a syntax tree with an error at the"]
-    #[doc = " root, and one or more partial syntax trees within the error. This behavior"]
-    #[doc = " may not be supported long-term."]
-    pub fn ts_parser_halt_on_error(self_: *mut TSParser, halt: bool);
 }
 extern "C" {
     #[doc = " Create a shallow copy of the syntax tree. This is very fast."]
@@ -659,14 +667,23 @@ extern "C" {
     ) -> *const ::std::os::raw::c_char;
 }
 extern "C" {
-    #[doc = " Disable a certain capture within a query. This prevents the capture"]
-    #[doc = " from being returned in matches, and also avoids any resource usage"]
-    #[doc = " associated with recording the capture."]
+    #[doc = " Disable a certain capture within a query."]
+    #[doc = ""]
+    #[doc = " This prevents the capture from being returned in matches, and also avoids"]
+    #[doc = " any resource usage associated with recording the capture. Currently, there"]
+    #[doc = " is no way to undo this."]
     pub fn ts_query_disable_capture(
         arg1: *mut TSQuery,
         arg2: *const ::std::os::raw::c_char,
         arg3: u32,
     );
+}
+extern "C" {
+    #[doc = " Disable a certain pattern within a query."]
+    #[doc = ""]
+    #[doc = " This prevents the pattern from matching and removes most of the overhead"]
+    #[doc = " associated with the pattern. Currently, there is no way to undo this."]
+    pub fn ts_query_disable_pattern(arg1: *mut TSQuery, arg2: u32);
 }
 extern "C" {
     #[doc = " Create a new cursor for executing a given query."]

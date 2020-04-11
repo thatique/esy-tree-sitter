@@ -4,20 +4,27 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, ptr, slice, str};
 use tree_sitter_highlight::{
-    c, Error, HighlightConfiguration, HighlightEvent, Highlighter, HtmlRenderer,
+    c, Error, Highlight, HighlightConfiguration, HighlightEvent, Highlighter, HtmlRenderer,
 };
 
 lazy_static! {
     static ref JS_HIGHLIGHT: HighlightConfiguration =
-        get_highlight_config("javascript", "injections.scm", &HIGHLIGHT_NAMES);
+        get_highlight_config("javascript", Some("injections.scm"), &HIGHLIGHT_NAMES);
+    static ref JSDOC_HIGHLIGHT: HighlightConfiguration =
+        get_highlight_config("jsdoc", None, &HIGHLIGHT_NAMES);
     static ref HTML_HIGHLIGHT: HighlightConfiguration =
-        get_highlight_config("html", "injections.scm", &HIGHLIGHT_NAMES);
-    static ref EJS_HIGHLIGHT: HighlightConfiguration =
-        get_highlight_config("embedded-template", "injections-ejs.scm", &HIGHLIGHT_NAMES);
+        get_highlight_config("html", Some("injections.scm"), &HIGHLIGHT_NAMES);
+    static ref EJS_HIGHLIGHT: HighlightConfiguration = get_highlight_config(
+        "embedded-template",
+        Some("injections-ejs.scm"),
+        &HIGHLIGHT_NAMES
+    );
     static ref RUST_HIGHLIGHT: HighlightConfiguration =
-        get_highlight_config("rust", "injections.scm", &HIGHLIGHT_NAMES);
+        get_highlight_config("rust", Some("injections.scm"), &HIGHLIGHT_NAMES);
     static ref HIGHLIGHT_NAMES: Vec<String> = [
         "attribute",
+        "carriage-return",
+        "comment",
         "constant",
         "constructor",
         "function.builtin",
@@ -317,8 +324,21 @@ fn test_highlighting_empty_lines() {
 }
 
 #[test]
-fn test_highlighting_ejs() {
-    let source = vec!["<div><% foo() %></div>"].join("\n");
+fn test_highlighting_carriage_returns() {
+    let source = "a = \"a\rb\"\r\nb\r";
+
+    assert_eq!(
+        &to_html(&source, &JS_HIGHLIGHT).unwrap(),
+        &[
+            "<span class=variable>a</span> <span class=operator>=</span> <span class=string>&quot;a<span class=carriage-return></span>b&quot;</span>\n",
+            "<span class=variable>b</span>\n",
+        ],
+    );
+}
+
+#[test]
+fn test_highlighting_ejs_with_html_and_javascript() {
+    let source = vec!["<div><% foo() %></div><script> bar() </script>"].join("\n");
 
     assert_eq!(
         &to_token_vector(&source, &EJS_HIGHLIGHT).unwrap(),
@@ -335,7 +355,48 @@ fn test_highlighting_ejs() {
             ("%>", vec!["keyword"]),
             ("</", vec!["punctuation.bracket"]),
             ("div", vec!["tag"]),
-            (">", vec!["punctuation.bracket"])
+            (">", vec!["punctuation.bracket"]),
+            ("<", vec!["punctuation.bracket"]),
+            ("script", vec!["tag"]),
+            (">", vec!["punctuation.bracket"]),
+            (" ", vec![]),
+            ("bar", vec!["function"]),
+            ("(", vec!["punctuation.bracket"]),
+            (")", vec!["punctuation.bracket"]),
+            (" ", vec![]),
+            ("</", vec!["punctuation.bracket"]),
+            ("script", vec!["tag"]),
+            (">", vec!["punctuation.bracket"]),
+        ]],
+    );
+}
+
+#[test]
+fn test_highlighting_javascript_with_jsdoc() {
+    // Regression test: the middle comment has no highlights. This should not prevent
+    // later injections from highlighting properly.
+    let source = vec!["a /* @see a */ b; /* nothing */ c; /* @see b */"].join("\n");
+
+    assert_eq!(
+        &to_token_vector(&source, &JS_HIGHLIGHT).unwrap(),
+        &[[
+            ("a", vec!["variable"]),
+            (" ", vec![]),
+            ("/* ", vec!["comment"]),
+            ("@see", vec!["comment", "keyword"]),
+            (" a */", vec!["comment"]),
+            (" ", vec![]),
+            ("b", vec!["variable"]),
+            (";", vec!["punctuation.delimiter"]),
+            (" ", vec![]),
+            ("/* nothing */", vec!["comment"]),
+            (" ", vec![]),
+            ("c", vec!["variable"]),
+            (";", vec!["punctuation.delimiter"]),
+            (" ", vec![]),
+            ("/* ", vec!["comment"]),
+            ("@see", vec!["comment", "keyword"]),
+            (" b */", vec!["comment"])
         ]],
     );
 }
@@ -551,6 +612,7 @@ fn test_language_for_injection_string<'a>(string: &str) -> Option<&'a HighlightC
         "javascript" => Some(&JS_HIGHLIGHT),
         "html" => Some(&HTML_HIGHLIGHT),
         "rust" => Some(&RUST_HIGHLIGHT),
+        "jsdoc" => Some(&JSDOC_HIGHLIGHT),
         _ => None,
     }
 }
@@ -569,6 +631,12 @@ fn to_html<'a>(
         &test_language_for_injection_string,
     )?;
 
+    renderer.set_carriage_return_highlight(
+        HIGHLIGHT_NAMES
+            .iter()
+            .position(|s| s == "carriage-return")
+            .map(Highlight),
+    );
     renderer
         .render(events, src, &|highlight| HTML_ATTRS[highlight.0].as_bytes())
         .unwrap();

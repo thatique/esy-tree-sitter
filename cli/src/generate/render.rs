@@ -327,22 +327,33 @@ impl Generator {
         for symbol in &self.parse_table.symbols {
             let mut mapping = symbol;
 
-            // If this symbol has a simple alias, then check if its alias has the same
-            // name and kind (e.g. named vs anonymous) as some other symbol in the grammar.
-            // If so, add an entry to the symbol map that deduplicates these two symbols,
-            // so that only one of them will ever be returned via the public API.
+            // There can be multiple symbols in the grammar that have the same name and kind,
+            // due to simple aliases. When that happens, ensure that they map to the same
+            // public-facing symbol. If one of the symbols is not aliased, choose that one
+            // to be the public-facing symbol. Otherwise, pick the symbol with the lowest
+            // numeric value.
             if let Some(alias) = self.simple_aliases.get(symbol) {
                 let kind = alias.kind();
                 for other_symbol in &self.parse_table.symbols {
-                    if other_symbol == symbol {
-                        continue;
-                    }
                     if let Some(other_alias) = self.simple_aliases.get(other_symbol) {
-                        if other_symbol < symbol && other_alias == alias {
+                        if other_symbol < mapping && other_alias == alias {
                             mapping = other_symbol;
-                            break;
                         }
                     } else if self.metadata_for_symbol(*other_symbol) == (&alias.value, kind) {
+                        mapping = other_symbol;
+                        break;
+                    }
+                }
+            }
+            // Two anonymous tokens with different flags but the same string value
+            // should be represented with the same symbol in the public API. Examples:
+            // *  "<" and token(prec(1, "<"))
+            // *  "(" and token.immediate("(")
+            else if symbol.is_terminal() {
+                let metadata = self.metadata_for_symbol(*symbol);
+                for other_symbol in &self.parse_table.symbols {
+                    let other_metadata = self.metadata_for_symbol(*other_symbol);
+                    if other_metadata == metadata {
                         mapping = other_symbol;
                         break;
                     }
@@ -353,7 +364,7 @@ impl Generator {
                 self,
                 "[{}] = {},",
                 self.symbol_ids[&symbol],
-                self.symbol_ids[&mapping],
+                self.symbol_ids[mapping],
             );
         }
 
@@ -1062,6 +1073,10 @@ impl Generator {
         let language_function_name = format!("tree_sitter_{}", self.language_name);
         let external_scanner_name = format!("{}_external_scanner", language_function_name);
 
+        add_line!(self, "#ifdef __cplusplus");
+        add_line!(self, r#"extern "C" {{"#);
+        add_line!(self, "#endif");
+
         if !self.syntax_grammar.external_tokens.is_empty() {
             add_line!(self, "void *{}_create(void);", external_scanner_name);
             add_line!(self, "void {}_destroy(void *);", external_scanner_name);
@@ -1187,6 +1202,9 @@ impl Generator {
         add_line!(self, "return &language;");
         dedent!(self);
         add_line!(self, "}}");
+        add_line!(self, "#ifdef __cplusplus");
+        add_line!(self, "}}");
+        add_line!(self, "#endif");
     }
 
     fn get_parse_action_list_id(

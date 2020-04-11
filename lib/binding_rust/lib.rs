@@ -1,11 +1,6 @@
 mod ffi;
 mod util;
 
-extern crate regex;
-extern crate serde;
-extern crate serde_derive;
-extern crate serde_json;
-
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
@@ -15,7 +10,7 @@ use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
-use std::{char, fmt, iter, ptr, slice, str, u16};
+use std::{char, fmt, hash, iter, ptr, slice, str, u16};
 
 /// The latest ABI version that is supported by the current version of the
 /// library.
@@ -44,7 +39,7 @@ pub struct Tree(NonNull<ffi::TSTree>);
 /// A position in a multi-line text document, in terms of rows and columns.
 ///
 /// Rows and columns are zero-based.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Point {
     pub row: usize,
     pub column: usize,
@@ -52,7 +47,7 @@ pub struct Point {
 
 /// A range of positions in a multi-line text document, both in terms of bytes and of
 /// rows and columns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Range {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -100,6 +95,7 @@ pub struct Query {
     text_predicates: Vec<Box<[TextPredicate]>>,
     property_settings: Vec<Box<[QueryProperty]>>,
     property_predicates: Vec<Box<[(QueryProperty, bool)]>>,
+    general_predicates: Vec<Box<[QueryPredicate]>>,
 }
 
 /// A stateful object for executing a `Query` on a syntax `Tree`.
@@ -111,6 +107,19 @@ pub struct QueryProperty {
     pub key: Box<str>,
     pub value: Option<Box<str>>,
     pub capture_id: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum QueryPredicateArg {
+    Capture(u32),
+    String(Box<str>),
+}
+
+/// A key-value pair associated with a particular pattern in a `Query`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct QueryPredicate {
+    pub operator: Box<str>,
+    pub args: Vec<QueryPredicateArg>,
 }
 
 /// A match of a `Query` to a particular set of `Node`s.
@@ -142,6 +151,10 @@ pub struct LanguageError {
     version: usize,
 }
 
+/// An error that occurred in `Parser::set_included_ranges`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IncludedRangesError(pub usize);
+
 /// An error that occurred when trying to create a `Query`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum QueryError {
@@ -154,8 +167,8 @@ pub enum QueryError {
 
 #[derive(Debug)]
 enum TextPredicate {
-    CaptureEqString(u32, String),
-    CaptureEqCapture(u32, u32),
+    CaptureEqString(u32, String, bool),
+    CaptureEqCapture(u32, u32, bool),
     CaptureMatchString(u32, regex::bytes::Regex),
 }
 
@@ -172,10 +185,25 @@ impl Language {
     }
 
     /// Get the name of the node kind for the given numerical id.
-    pub fn node_kind_for_id(&self, id: u16) -> &'static str {
-        unsafe { CStr::from_ptr(ffi::ts_language_symbol_name(self.0, id)) }
-            .to_str()
-            .unwrap()
+    pub fn node_kind_for_id(&self, id: u16) -> Option<&'static str> {
+        let ptr = unsafe { ffi::ts_language_symbol_name(self.0, id) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
+        }
+    }
+
+    /// Get the numeric id for the given node kind.
+    pub fn id_for_node_kind(&self, kind: &str, named: bool) -> u16 {
+        unsafe {
+            ffi::ts_language_symbol_for_name(
+                self.0,
+                kind.as_bytes().as_ptr() as *const c_char,
+                kind.len() as u32,
+                named,
+            )
+        }
     }
 
     /// Check if the node type for the given numerical id is named (as opposed
@@ -184,16 +212,25 @@ impl Language {
         unsafe { ffi::ts_language_symbol_type(self.0, id) == ffi::TSSymbolType_TSSymbolTypeRegular }
     }
 
+    pub fn node_kind_is_visible(&self, id: u16) -> bool {
+        unsafe {
+            ffi::ts_language_symbol_type(self.0, id) <= ffi::TSSymbolType_TSSymbolTypeAnonymous
+        }
+    }
+
     /// Get the number of distinct field names in this language.
     pub fn field_count(&self) -> usize {
         unsafe { ffi::ts_language_field_count(self.0) as usize }
     }
 
     /// Get the field names for the given numerical id.
-    pub fn field_name_for_id(&self, field_id: u16) -> &'static str {
-        unsafe { CStr::from_ptr(ffi::ts_language_field_name_for_id(self.0, field_id)) }
-            .to_str()
-            .unwrap()
+    pub fn field_name_for_id(&self, field_id: u16) -> Option<&'static str> {
+        let ptr = unsafe { ffi::ts_language_field_name_for_id(self.0, field_id) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
+        }
     }
 
     /// Get the numerical id for the given field name.
@@ -508,16 +545,41 @@ impl Parser {
     /// allows you to parse only a *portion* of a document but still return a syntax
     /// tree whose ranges match up with the document as a whole. You can also pass
     /// multiple disjoint ranges.
-    pub fn set_included_ranges(&mut self, ranges: &[Range]) {
+    ///
+    /// If `ranges` is empty, then the entire document will be parsed. Otherwise,
+    /// the given ranges must be ordered from earliest to latest in the document,
+    /// and they must not overlap. That is, the following must hold for all
+    /// `i` < `length - 1`:
+    /// ```text
+    ///     ranges[i].end_byte <= ranges[i + 1].start_byte
+    /// ```
+    /// If this requirement is not satisfied, method will panic.
+    pub fn set_included_ranges<'a>(
+        &mut self,
+        ranges: &'a [Range],
+    ) -> Result<(), IncludedRangesError> {
         let ts_ranges: Vec<ffi::TSRange> =
             ranges.iter().cloned().map(|range| range.into()).collect();
-        unsafe {
+        let result = unsafe {
             ffi::ts_parser_set_included_ranges(
                 self.0.as_ptr(),
                 ts_ranges.as_ptr(),
                 ts_ranges.len() as u32,
             )
         };
+
+        if result {
+            Ok(())
+        } else {
+            let mut prev_end_byte = 0;
+            for (i, range) in ranges.iter().enumerate() {
+                if range.start_byte < prev_end_byte || range.end_byte < range.start_byte {
+                    return Err(IncludedRangesError(i));
+                }
+                prev_end_byte = range.end_byte;
+            }
+            Err(IncludedRangesError(0))
+        }
     }
 
     /// Get the parser's current cancellation flag pointer.
@@ -621,6 +683,16 @@ impl<'tree> Node<'tree> {
         } else {
             Some(Node(node, PhantomData))
         }
+    }
+
+    /// Get a numeric id for this node that is unique.
+    ///
+    /// Within a given syntax tree, no two nodes have the same id. However, if
+    /// a new tree is created based on an older tree, and a node from the old
+    /// tree is reused in the process, then that node will have the same id in
+    /// both trees.
+    pub fn id(&self) -> usize {
+        self.0.id as usize
     }
 
     /// Get this node's type as a numerical id.
@@ -954,6 +1026,18 @@ impl<'a> PartialEq for Node<'a> {
     }
 }
 
+impl<'a> Eq for Node<'a> {}
+
+impl<'a> hash::Hash for Node<'a> {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.0.id.hash(state);
+        self.0.context[0].hash(state);
+        self.0.context[1].hash(state);
+        self.0.context[2].hash(state);
+        self.0.context[3].hash(state);
+    }
+}
+
 impl<'a> fmt::Debug for Node<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
@@ -990,7 +1074,7 @@ impl<'a> TreeCursor<'a> {
     }
 
     /// Get the field name of this tree cursor's current node.
-    pub fn field_name(&self) -> Option<&str> {
+    pub fn field_name(&self) -> Option<&'static str> {
         unsafe {
             let ptr = ffi::ts_tree_cursor_current_field_name(&self.0);
             if ptr.is_null() {
@@ -1124,6 +1208,7 @@ impl Query {
             text_predicates: Vec::with_capacity(pattern_count),
             property_predicates: Vec::with_capacity(pattern_count),
             property_settings: Vec::with_capacity(pattern_count),
+            general_predicates: Vec::with_capacity(pattern_count),
         };
 
         // Build a vector of strings to store the capture names.
@@ -1167,6 +1252,7 @@ impl Query {
             let mut text_predicates = Vec::new();
             let mut property_predicates = Vec::new();
             let mut property_settings = Vec::new();
+            let mut general_predicates = Vec::new();
             for p in predicate_steps.split(|s| s.type_ == type_done) {
                 if p.is_empty() {
                     continue;
@@ -1182,7 +1268,7 @@ impl Query {
                 // Build a predicate for each of the known predicate function names.
                 let operator_name = &string_values[p[0].value_id as usize];
                 match operator_name.as_str() {
-                    "eq?" => {
+                    "eq?" | "not-eq?" => {
                         if p.len() != 3 {
                             return Err(QueryError::Predicate(format!(
                                 "Wrong number of arguments to eq? predicate. Expected 2, got {}.",
@@ -1196,12 +1282,18 @@ impl Query {
                             )));
                         }
 
+                        let is_positive = operator_name == "eq?";
                         text_predicates.push(if p[2].type_ == type_capture {
-                            TextPredicate::CaptureEqCapture(p[1].value_id, p[2].value_id)
+                            TextPredicate::CaptureEqCapture(
+                                p[1].value_id,
+                                p[2].value_id,
+                                is_positive,
+                            )
                         } else {
                             TextPredicate::CaptureEqString(
                                 p[1].value_id,
                                 string_values[p[2].value_id as usize].clone(),
+                                is_positive,
                             )
                         });
                     }
@@ -1252,12 +1344,21 @@ impl Query {
                         operator_name == "is?",
                     )),
 
-                    _ => {
-                        return Err(QueryError::Predicate(format!(
-                            "Unknown query predicate function {}",
-                            operator_name,
-                        )))
-                    }
+                    _ => general_predicates.push(QueryPredicate {
+                        operator: operator_name.clone().into_boxed_str(),
+                        args: p[1..]
+                            .iter()
+                            .map(|a| {
+                                if a.type_ == type_capture {
+                                    QueryPredicateArg::Capture(a.value_id)
+                                } else {
+                                    QueryPredicateArg::String(
+                                        string_values[a.value_id as usize].clone().into_boxed_str(),
+                                    )
+                                }
+                            })
+                            .collect(),
+                    }),
                 }
             }
 
@@ -1270,6 +1371,9 @@ impl Query {
             result
                 .property_settings
                 .push(property_settings.into_boxed_slice());
+            result
+                .general_predicates
+                .push(general_predicates.into_boxed_slice());
         }
         Ok(result)
     }
@@ -1299,13 +1403,28 @@ impl Query {
     }
 
     /// Get the properties that are checked for the given pattern index.
+    ///
+    /// This includes predicates with the operators `is?` and `is-not?`.
     pub fn property_predicates(&self, index: usize) -> &[(QueryProperty, bool)] {
         &self.property_predicates[index]
     }
 
     /// Get the properties that are set for the given pattern index.
+    ///
+    /// This includes predicates with the operator `set!`.
     pub fn property_settings(&self, index: usize) -> &[QueryProperty] {
         &self.property_settings[index]
+    }
+
+    /// Get the other user-defined predicates associated with the given index.
+    ///
+    /// This includes predicate with operators other than:
+    /// * `match?`
+    /// * `eq?` and `not-eq?
+    /// * `is?` and `is-not?`
+    /// * `set!`
+    pub fn general_predicates(&self, index: usize) -> &[QueryPredicate] {
+        &self.general_predicates[index]
     }
 
     /// Disable a certain capture within a query.
@@ -1322,6 +1441,14 @@ impl Query {
         }
     }
 
+    /// Disable a certain pattern within a query.
+    ///
+    /// This prevents the pattern from matching, and also avoids any resource usage
+    /// associated with the pattern.
+    pub fn disable_pattern(&mut self, index: usize) {
+        unsafe { ffi::ts_query_disable_pattern(self.ptr.as_ptr(), index as u32) }
+    }
+
     fn parse_property(
         function_name: &str,
         capture_names: &[String],
@@ -1336,41 +1463,39 @@ impl Query {
             )));
         }
 
-        let mut i = 0;
         let mut capture_id = None;
-        if args[i].type_ == ffi::TSQueryPredicateStepType_TSQueryPredicateStepTypeCapture {
-            capture_id = Some(args[i].value_id as usize);
-            i += 1;
-
-            if i == args.len() {
-                return Err(QueryError::Predicate(format!(
-                    "No key specified for {} predicate.",
-                    function_name,
-                )));
-            }
-            if args[i].type_ == ffi::TSQueryPredicateStepType_TSQueryPredicateStepTypeCapture {
-                return Err(QueryError::Predicate(format!(
-                    "Invalid arguments to {} predicate. Expected string, got @{}",
-                    function_name, capture_names[args[i].value_id as usize]
-                )));
-            }
-        }
-
-        let key = &string_values[args[i].value_id as usize];
-        i += 1;
-
+        let mut key = None;
         let mut value = None;
-        if i < args.len() {
-            if args[i].type_ == ffi::TSQueryPredicateStepType_TSQueryPredicateStepTypeCapture {
+
+        for arg in args {
+            if arg.type_ == ffi::TSQueryPredicateStepType_TSQueryPredicateStepTypeCapture {
+                if capture_id.is_some() {
+                    return Err(QueryError::Predicate(format!(
+                        "Invalid arguments to {} predicate. Unexpected second capture name @{}",
+                        function_name, capture_names[arg.value_id as usize]
+                    )));
+                }
+                capture_id = Some(arg.value_id as usize);
+            } else if key.is_none() {
+                key = Some(&string_values[arg.value_id as usize]);
+            } else if value.is_none() {
+                value = Some(string_values[arg.value_id as usize].as_str());
+            } else {
                 return Err(QueryError::Predicate(format!(
-                    "Invalid arguments to {} predicate. Expected string, got @{}",
-                    function_name, capture_names[args[i].value_id as usize]
+                    "Invalid arguments to {} predicate. Unexpected third argument @{}",
+                    function_name, string_values[arg.value_id as usize]
                 )));
             }
-            value = Some(string_values[args[i].value_id as usize].as_str());
         }
 
-        Ok(QueryProperty::new(key, value, capture_id))
+        if let Some(key) = key {
+            Ok(QueryProperty::new(key, value, capture_id))
+        } else {
+            return Err(QueryError::Predicate(format!(
+                "Invalid arguments to {} predicate. Missing key argument",
+                function_name,
+            )));
+        }
     }
 }
 
@@ -1388,7 +1513,7 @@ impl QueryCursor {
     /// Because multiple patterns can match the same set of nodes, one match may contain
     /// captures that appear *before* some of the captures from a previous match.
     pub fn matches<'a, T: AsRef<[u8]>>(
-        &mut self,
+        &'a mut self,
         query: &'a Query,
         node: Node<'a>,
         mut text_callback: impl FnMut(Node<'a>) -> T + 'a,
@@ -1415,7 +1540,7 @@ impl QueryCursor {
     /// This is useful if don't care about which pattern matched, and just want a single,
     /// ordered sequence of captures.
     pub fn captures<'a, T: AsRef<[u8]>>(
-        &mut self,
+        &'a mut self,
         query: &'a Query,
         node: Node<'a>,
         text_callback: impl FnMut(Node<'a>) -> T + 'a,
@@ -1473,14 +1598,14 @@ impl<'a> QueryMatch<'a> {
         query.text_predicates[self.pattern_index]
             .iter()
             .all(|predicate| match predicate {
-                TextPredicate::CaptureEqCapture(i, j) => {
+                TextPredicate::CaptureEqCapture(i, j, is_positive) => {
                     let node1 = self.capture_for_index(*i).unwrap();
                     let node2 = self.capture_for_index(*j).unwrap();
-                    text_callback(node1).as_ref() == text_callback(node2).as_ref()
+                    (text_callback(node1).as_ref() == text_callback(node2).as_ref()) == *is_positive
                 }
-                TextPredicate::CaptureEqString(i, s) => {
+                TextPredicate::CaptureEqString(i, s, is_positive) => {
                     let node = self.capture_for_index(*i).unwrap();
-                    text_callback(node).as_ref() == s.as_bytes()
+                    (text_callback(node).as_ref() == s.as_bytes()) == *is_positive
                 }
                 TextPredicate::CaptureMatchString(i, r) => {
                     let node = self.capture_for_index(*i).unwrap();

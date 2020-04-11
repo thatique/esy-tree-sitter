@@ -2,7 +2,8 @@ use super::helpers::allocations;
 use super::helpers::fixtures::get_language;
 use std::fmt::Write;
 use tree_sitter::{
-    Node, Parser, Query, QueryCapture, QueryCursor, QueryError, QueryMatch, QueryProperty,
+    Node, Parser, Query, QueryCapture, QueryCursor, QueryError, QueryMatch, QueryPredicate,
+    QueryPredicateArg, QueryProperty,
 };
 
 #[test]
@@ -403,6 +404,245 @@ fn test_query_matches_capturing_error_nodes() {
 }
 
 #[test]
+fn test_query_matches_with_named_wildcard() {
+    allocations::record(|| {
+        let language = get_language("javascript");
+        let query = Query::new(
+            language,
+            "
+            (return_statement (*) @the-return-value)
+            (binary_expression operator: * @the-operator)
+            ",
+        )
+        .unwrap();
+
+        let source = "return a + b - c;";
+
+        let mut parser = Parser::new();
+        parser.set_language(language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = QueryCursor::new();
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[
+                (0, vec![("the-return-value", "a + b - c")]),
+                (1, vec![("the-operator", "+")]),
+                (1, vec![("the-operator", "-")]),
+            ]
+        );
+    });
+}
+
+#[test]
+fn test_query_matches_with_wildcard_at_the_root() {
+    allocations::record(|| {
+        let language = get_language("javascript");
+        let mut cursor = QueryCursor::new();
+        let mut parser = Parser::new();
+        parser.set_language(language).unwrap();
+
+        let query = Query::new(
+            language,
+            "
+            (*
+                (comment) @doc
+                .
+                (function_declaration
+                    name: (identifier) @name))
+            ",
+        )
+        .unwrap();
+
+        let source = "/* one */ var x; /* two */ function y() {} /* three */ class Z {}";
+
+        let tree = parser.parse(source, None).unwrap();
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[(0, vec![("doc", "/* two */"), ("name", "y")]),]
+        );
+
+        let query = Query::new(
+            language,
+            "
+                (* (string) @a)
+                (* (number) @b)
+                (* (true) @c)
+                (* (false) @d)
+            ",
+        )
+        .unwrap();
+
+        let source = "['hi', x(true), {y: false}]";
+
+        let tree = parser.parse(source, None).unwrap();
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[
+                (0, vec![("a", "'hi'")]),
+                (2, vec![("c", "true")]),
+                (3, vec![("d", "false")]),
+            ]
+        );
+    });
+}
+
+#[test]
+fn test_query_matches_with_immediate_siblings() {
+    allocations::record(|| {
+        let language = get_language("python");
+
+        // The immediate child operator '.' can be used in three similar ways:
+        // 1. Before the first child node in a pattern, it means that there cannot be any
+        //    named siblings before that child node.
+        // 2. After the last child node in a pattern, it means that there cannot be any named
+        //    sibling after that child node.
+        // 2. Between two child nodes in a pattern, it specifies that there cannot be any
+        //    named siblings between those two child snodes.
+        let query = Query::new(
+            language,
+            "
+            (dotted_name
+                (identifier) @parent
+                .
+                (identifier) @child)
+            (dotted_name
+                (identifier) @last-child
+                .)
+            (list
+                .
+                (*) @first-element)
+            ",
+        )
+        .unwrap();
+
+        let source = "import a.b.c.d; return [w, [1, y], z]";
+
+        let mut parser = Parser::new();
+        parser.set_language(language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = QueryCursor::new();
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[
+                (0, vec![("parent", "a"), ("child", "b")]),
+                (0, vec![("parent", "b"), ("child", "c")]),
+                (1, vec![("last-child", "d")]),
+                (0, vec![("parent", "c"), ("child", "d")]),
+                (2, vec![("first-element", "w")]),
+                (2, vec![("first-element", "1")]),
+            ]
+        );
+    });
+}
+
+#[test]
+fn test_query_matches_with_repeated_leaf_nodes() {
+    allocations::record(|| {
+        let language = get_language("javascript");
+
+        let query = Query::new(
+            language,
+            "
+            (*
+                (comment)+ @doc
+                .
+                (class_declaration
+                    name: (identifier) @name))
+
+            (*
+                (comment)+ @doc
+                .
+                (function_declaration
+                    name: (identifier) @name))
+            ",
+        )
+        .unwrap();
+
+        let source = "
+            // one
+            // two
+            a();
+
+            // three
+            {
+                // four
+                // five
+                // six
+                class B {}
+
+                // seven
+                c();
+
+                // eight
+                function d() {}
+            }
+        ";
+
+        let mut parser = Parser::new();
+        parser.set_language(language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = QueryCursor::new();
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[
+                (
+                    0,
+                    vec![
+                        ("doc", "// four"),
+                        ("doc", "// five"),
+                        ("doc", "// six"),
+                        ("name", "B")
+                    ]
+                ),
+                (1, vec![("doc", "// eight"), ("name", "d")]),
+            ]
+        );
+    });
+}
+
+#[test]
+fn test_query_matches_with_repeated_internal_nodes() {
+    allocations::record(|| {
+        let language = get_language("javascript");
+        let mut parser = Parser::new();
+        parser.set_language(language).unwrap();
+        let mut cursor = QueryCursor::new();
+
+        let query = Query::new(
+            language,
+            "
+            (*
+                (method_definition
+                    (decorator (identifier) @deco)+
+                    name: (property_identifier) @name))
+            ",
+        )
+        .unwrap();
+        let source = "
+            class A {
+                @c
+                @d
+                e() {}
+            }
+        ";
+        let tree = parser.parse(source, None).unwrap();
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[(0, vec![("deco", "c"), ("deco", "d"), ("name", "e")]),]
+        );
+    })
+}
+
+#[test]
 fn test_query_matches_in_language_with_simple_aliases() {
     allocations::record(|| {
         let language = get_language("html");
@@ -433,6 +673,41 @@ fn test_query_matches_in_language_with_simple_aliases() {
                 (0, vec![("tag", "style")]),
                 (0, vec![("tag", "div")]),
             ],
+        );
+    });
+}
+
+#[test]
+fn test_query_matches_with_different_tokens_with_the_same_string_value() {
+    allocations::record(|| {
+        let language = get_language("rust");
+        let query = Query::new(
+            language,
+            r#"
+                "<" @less
+                ">" @greater
+                "#,
+        )
+        .unwrap();
+
+        // In Rust, there are two '<' tokens: one for the binary operator,
+        // and one with higher precedence for generics.
+        let source = "const A: B<C> = d < e || f > g;";
+
+        let mut parser = Parser::new();
+        parser.set_language(language).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let mut cursor = QueryCursor::new();
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[
+                (0, vec![("less", "<")]),
+                (1, vec![("greater", ">")]),
+                (0, vec![("less", "<")]),
+                (1, vec![("greater", ">")]),
+            ]
         );
     });
 }
@@ -591,7 +866,60 @@ fn test_query_matches_different_queries_same_cursor() {
 }
 
 #[test]
-fn test_query_captures() {
+fn test_query_matches_with_multiple_captures_on_a_node() {
+    allocations::record(|| {
+        let language = get_language("javascript");
+        let mut query = Query::new(
+            language,
+            "(function_declaration
+                (identifier) @name1 @name2 @name3
+                (statement_block) @body1 @body2)",
+        )
+        .unwrap();
+
+        let source = "function foo() { return 1; }";
+        let mut parser = Parser::new();
+        let mut cursor = QueryCursor::new();
+
+        parser.set_language(language).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[(
+                0,
+                vec![
+                    ("name1", "foo"),
+                    ("name2", "foo"),
+                    ("name3", "foo"),
+                    ("body1", "{ return 1; }"),
+                    ("body2", "{ return 1; }"),
+                ]
+            ),]
+        );
+
+        // disabling captures still works when there are multiple captures on a
+        // single node.
+        query.disable_capture("name2");
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[(
+                0,
+                vec![
+                    ("name1", "foo"),
+                    ("name3", "foo"),
+                    ("body1", "{ return 1; }"),
+                    ("body2", "{ return 1; }"),
+                ]
+            ),]
+        );
+    });
+}
+
+#[test]
+fn test_query_captures_basic() {
     allocations::record(|| {
         let language = get_language("javascript");
         let query = Query::new(
@@ -714,7 +1042,7 @@ fn test_query_captures_with_text_conditions() {
 }
 
 #[test]
-fn test_query_captures_with_set_properties() {
+fn test_query_captures_with_predicates() {
     allocations::record(|| {
         let language = get_language("javascript");
 
@@ -723,7 +1051,8 @@ fn test_query_captures_with_set_properties() {
             r#"
             ((call_expression (identifier) @foo)
              (set! name something)
-             (set! cool))
+             (set! cool)
+             (something! @foo omg))
 
             ((property_identifier) @bar
              (is? cool)
@@ -738,6 +1067,16 @@ fn test_query_captures_with_set_properties() {
                 QueryProperty::new("cool", None, None),
             ]
         );
+        assert_eq!(
+            query.general_predicates(0),
+            &[QueryPredicate {
+                operator: "something!".to_string().into_boxed_str(),
+                args: vec![
+                    QueryPredicateArg::Capture(0),
+                    QueryPredicateArg::String("omg".to_string().into_boxed_str()),
+                ],
+            },]
+        );
         assert_eq!(query.property_settings(1), &[]);
         assert_eq!(query.property_predicates(0), &[]);
         assert_eq!(
@@ -746,6 +1085,53 @@ fn test_query_captures_with_set_properties() {
                 (QueryProperty::new("cool", None, None), true),
                 (QueryProperty::new("name", Some("something"), None), false),
             ]
+        );
+    });
+}
+
+#[test]
+fn test_query_captures_with_quoted_predicate_args() {
+    allocations::record(|| {
+        let language = get_language("javascript");
+
+        // Double-quoted strings can contain:
+        // * special escape sequences like \n and \r
+        // * escaped double quotes with \*
+        // * literal backslashes with \\
+        let query = Query::new(
+            language,
+            r#"
+            ((call_expression (identifier) @foo)
+             (set! one "\"something\ngreat\""))
+
+            ((identifier)
+             (set! two "\\s(\r?\n)*$"))
+
+            ((function_declaration)
+             (set! three "\"something\ngreat\""))
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            query.property_settings(0),
+            &[QueryProperty::new(
+                "one",
+                Some("\"something\ngreat\""),
+                None
+            )]
+        );
+        assert_eq!(
+            query.property_settings(1),
+            &[QueryProperty::new("two", Some("\\s(\r?\n)*$"), None)]
+        );
+        assert_eq!(
+            query.property_settings(2),
+            &[QueryProperty::new(
+                "three",
+                Some("\"something\ngreat\""),
+                None
+            )]
         );
     });
 }
@@ -1234,6 +1620,45 @@ fn test_query_comments() {
         assert_eq!(
             collect_matches(matches, &query, source),
             &[(0, vec![("fn-name", "one")]),],
+        );
+    });
+}
+
+#[test]
+fn test_query_disable_pattern() {
+    allocations::record(|| {
+        let language = get_language("javascript");
+        let mut query = Query::new(
+            language,
+            "
+                (function_declaration
+                    name: (identifier) @name)
+                (function_declaration
+                    body: (statement_block) @body)
+                (class_declaration
+                    name: (identifier) @name)
+                (class_declaration
+                    body: (class_body) @body)
+            ",
+        )
+        .unwrap();
+
+        // disable the patterns that match names
+        query.disable_pattern(0);
+        query.disable_pattern(2);
+
+        let source = "class A { constructor() {} } function b() { return 1; }";
+        let mut parser = Parser::new();
+        parser.set_language(language).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = QueryCursor::new();
+        let matches = cursor.matches(&query, tree.root_node(), to_callback(source));
+        assert_eq!(
+            collect_matches(matches, &query, source),
+            &[
+                (3, vec![("body", "{ constructor() {} }")]),
+                (1, vec![("body", "{ return 1; }")]),
+            ],
         );
     });
 }
